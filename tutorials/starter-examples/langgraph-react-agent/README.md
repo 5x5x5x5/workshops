@@ -1,12 +1,13 @@
 # LangGraph ReAct Agent
 
-A ReAct agent using LangGraph's prebuilt `create_react_agent` with math tools, running on Flyte.
+A ReAct agent using LangGraph's prebuilt `create_react_agent` with math tools, running on [Modal](https://modal.com).
 
 ## What it does
 
 - Creates a ReAct (Reason + Act) agent with OpenAI and LangGraph
-- Defines simple math tools (`add`, `multiply`) with `@flyte.trace` for observability
+- Defines simple math tools (`add`, `multiply`)
 - The agent reasons about which tool to call, observes results, and loops until it has an answer
+- Runs inside a Modal container with the `OPENAI_API_KEY` injected from a Modal secret
 
 ## Setup
 
@@ -19,65 +20,34 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-## Flyte Cluster (for remote runs)
-
-To run remotely, configure your Flyte cluster endpoint:
+## Modal account (one-time)
 
 ```bash
-flyte create config \
-    --endpoint <your-endpoint> \
-    --auth-type headless \
-    --builder remote \
-    --domain development \
-    --project flytesnacks
+uv run modal setup
 ```
 
-Don't have a cluster? Request access at [flyte.org](https://flyte.org/).
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
+
+## OpenAI secret
+
+The agent reads `OPENAI_API_KEY` from a Modal secret named `openai-secret`. Create it once:
+
+```bash
+uv run modal secret create openai-secret OPENAI_API_KEY=sk-...
+```
+
+(Or create it in the Modal dashboard under **Secrets** using the OpenAI template.)
 
 ## Run
 
-**Remote:**
 ```bash
-uv run flyte run langgraph_react_agent.py agent --request "What is 12 * 7 plus 3?"
+uv run modal run langgraph_react_agent.py --request "What is 12 * 7 plus 3?"
 ```
 
-**Local:**
-```bash
-uv run flyte run --local langgraph_react_agent.py agent --request "What is 12 * 7 plus 3?"
-```
+Logs and traces for each run are available in the [Modal dashboard](https://modal.com/apps).
 
-**Local with TUI:**
+## Notes
 
-The TUI gives you a live interactive terminal dashboard showing each task's status, logs, and outputs as the run progresses.
-
-```bash
-uv pip install textual
-
-uv run flyte run --local --tui langgraph_react_agent.py agent --request "What is 12 * 7 plus 3?"
-```
-
-Browse past local runs in TUI:
-```bash
-uv run flyte start tui
-```
-
-## Fetch remote run output
-
-After a remote run completes, you can fetch the output with `flyte.remote`:
-
-```python
-import flyte
-from flyte.remote import Run
-
-flyte.init_from_config()
-
-runs = list(Run.listall(task_name="langgraph_env.agent", sort_by=("created_at", "desc"), limit=1))
-run = Run.get(runs[0].name)
-print(f"Phase: {run.phase}")
-if run.phase.name == "SUCCEEDED":
-    print(run.outputs())
-```
-
-## Requirements
-
-- `OPENAI_API_KEY` secret configured on your Flyte cluster
+- Dependencies are declared inline in the `modal.Image`, so the only local requirement is `modal`
+- `utils/file_viewer.py` is a notebook display helper used by the companion notebook
+- The companion notebook `tutorial_langgraph_react_agent.ipynb` still uses the Flyte SDK and has not been ported

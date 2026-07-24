@@ -1,27 +1,29 @@
-import duckdb
-import pandas as pd
+import modal
 
-import flyte
-import flyte.report
-
-env = flyte.TaskEnvironment(
-    name="duckdb-etl",
-    image=flyte.Image.from_debian_base().with_pip_packages("duckdb", "pandas", "pyarrow"),
-    resources=flyte.Resources(cpu=1, memory="1Gi"),
+image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "duckdb", "pandas", "pyarrow"
 )
+
+app = modal.App("duckdb-etl", image=image)
 
 SAMPLE_CSV = "https://raw.githubusercontent.com/datasciencedojo/datasets/master/titanic.csv"
 
-@env.task
-async def extract() -> pd.DataFrame:
+
+@app.function(cpu=1, memory=1024)
+def extract():
     """Load raw data from a CSV source."""
+    import duckdb
+
     df = duckdb.sql(f"SELECT * FROM read_csv_auto('{SAMPLE_CSV}')").df()
     print(f"Extracted {len(df)} rows")
     return df
 
-@env.task
-async def transform(raw: pd.DataFrame) -> pd.DataFrame:
+
+@app.function(cpu=1, memory=1024)
+def transform(raw):
     """Aggregate survival stats by passenger class using DuckDB SQL."""
+    import duckdb
+
     summary = duckdb.sql("""
         SELECT
             Pclass AS passenger_class,
@@ -36,20 +38,28 @@ async def transform(raw: pd.DataFrame) -> pd.DataFrame:
     print(summary.to_string(index=False))
     return summary
 
-@env.task(report=True)
-async def pipeline() -> pd.DataFrame:
-    """Extract → Transform pipeline."""
-    raw = await extract()
-    summary = await transform(raw)
 
-    await flyte.report.replace.aio(
+@app.function(cpu=1, memory=1024)
+def pipeline() -> str:
+    """Extract → Transform pipeline. Returns an HTML report."""
+    raw = extract.remote()
+    summary = transform.remote(raw)
+
+    return (
         f"<h2>DuckDB ETL Results</h2>"
         f"<p>Processed {len(raw)} rows into {len(summary)} groups</p>"
         f"<h3>Survival by Passenger Class</h3>"
         f"{summary.to_html(index=False)}"
     )
-    await flyte.report.flush.aio()
 
-    return summary
 
-# uv run flyte run duckdb_etl.py pipeline
+@app.local_entrypoint()
+def main():
+    html = pipeline.remote()
+    out = "duckdb_etl_report.html"
+    with open(out, "w") as f:
+        f.write(html)
+    print(f"Wrote report to {out}")
+
+
+# uv run modal run duckdb_etl.py

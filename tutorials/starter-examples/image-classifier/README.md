@@ -1,12 +1,13 @@
 # Image Classification Training
 
-Fine-tune a pretrained ResNet18 on the Beans dataset from HuggingFace.
+Fine-tune a pretrained ResNet18 on the Beans dataset from HuggingFace, on a GPU with [Modal](https://modal.com).
 
 ## What it does
 
-- **`load_data`** — Downloads the Beans dataset (3 classes, ~1000 images), applies ImageNet transforms, saves as tensors
-- **`train`** — Fine-tunes ResNet18 with a replaced classification head, trains with Adam + CrossEntropyLoss
+- **`load_data`** — Downloads the Beans dataset (3 classes, ~1000 images), applies ImageNet transforms, saves tensors to a shared `modal.Volume`
+- **`train`** — Fine-tunes ResNet18 with a replaced classification head on a T4 GPU, returns the trained weights
 - **`pipeline`** — Orchestrates load data -> train
+- **`main`** — A `local_entrypoint` that runs the pipeline and writes `resnet_beans.pt`
 
 ## Setup
 
@@ -19,29 +20,24 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-## Flyte Cluster (for remote runs)
-
-To run remotely, configure your Flyte cluster endpoint:
+## Modal account (one-time)
 
 ```bash
-flyte create config \
-    --endpoint <your-endpoint> \
-    --auth-type headless \
-    --builder remote \
-    --domain development \
-    --project flytesnacks
+uv run modal setup
 ```
 
-Don't have a cluster? Request access at [flyte.org](https://flyte.org/).
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
 
 ## Run
 
-**Remote:**
 ```bash
-uv run flyte run image_classifier.py pipeline --num_epochs 3
+uv run modal run image_classifier.py --num-epochs 3
 ```
 
-**Local:**
-```bash
-uv run flyte run --local image_classifier.py pipeline --num_epochs 3
-```
+The trained model is written to `resnet_beans.pt` in your working directory.
+
+## Notes
+
+- `load_data` runs on CPU and `train` runs on a T4 GPU — each `@app.function` requests exactly the resources it needs
+- The dataset tensors are passed between functions through the `image-classifier-data` volume
+- Dependencies are declared inline in the `modal.Image`, so the only local requirement is `modal`

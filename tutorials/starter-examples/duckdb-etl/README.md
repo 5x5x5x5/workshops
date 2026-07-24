@@ -1,12 +1,15 @@
 # DuckDB Data Pipeline
 
-Extract CSV data, transform with DuckDB SQL, and display results in a Flyte report.
+Extract CSV data, transform with DuckDB SQL, and render the results as an HTML report on [Modal](https://modal.com).
 
 ## What it does
 
 - **`extract`** — Loads the Titanic CSV from a public URL using DuckDB's `read_csv_auto`
 - **`transform`** — Aggregates survival statistics by passenger class using SQL
-- **`pipeline`** — Orchestrates extract -> transform, renders results as an HTML table in a Flyte report
+- **`pipeline`** — Orchestrates extract -> transform, returns the results as an HTML table
+- **`main`** — A `local_entrypoint` that runs the pipeline and writes `duckdb_etl_report.html`
+
+Each function runs in a container built from the `modal.Image` defined at the top of the script — no cluster to provision.
 
 ## Setup
 
@@ -19,34 +22,24 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-## Flyte Cluster (for remote runs)
-
-To run remotely, configure your Flyte cluster endpoint:
+## Modal account (one-time)
 
 ```bash
-flyte create config \
-    --endpoint <your-endpoint> \
-    --auth-type headless \
-    --builder remote \
-    --domain development \
-    --project flytesnacks
+uv run modal setup
 ```
 
-Don't have a cluster? Request access at [flyte.org](https://flyte.org/).
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
 
 ## Run
 
-**Remote:**
 ```bash
-uv run flyte run duckdb_etl.py pipeline
+uv run modal run duckdb_etl.py
 ```
 
-**Local:**
-```bash
-uv run flyte run --local duckdb_etl.py pipeline
-```
+The functions execute in the cloud; the report is written to `duckdb_etl_report.html` in your working directory.
 
 ## Notes
 
-- Fully self-contained — no external services or accounts needed
+- Fully self-contained — no external services or accounts beyond Modal needed
 - DuckDB can query pandas DataFrames directly with SQL
+- Dependencies are declared inline in the `modal.Image`, so the only local requirement is `modal`

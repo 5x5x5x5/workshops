@@ -1,32 +1,31 @@
 """
-Image Classification Training on Flyte
+Image Classification Training on Modal
 
 Fine-tune a pretrained ResNet on the Beans dataset from HuggingFace.
 
 Usage:
-    uv run flyte run image_classifier.py pipeline --num_epochs 3
+    uv run modal run image_classifier.py --num-epochs 3
 """
 
-import torch
-import torch.nn as nn
-from torchvision import models, transforms
+import modal
 
-import flyte
-import flyte.io
-
-env = flyte.TaskEnvironment(
-    name="image-classifier",
-    image=flyte.Image.from_debian_base().with_pip_packages(
-        "torch", "torchvision", "datasets", "Pillow",
-    ),
-    resources=flyte.Resources(cpu=2, memory="8Gi", gpu=1),
+image = modal.Image.debian_slim(python_version="3.11").pip_install(
+    "torch", "torchvision", "datasets", "Pillow"
 )
 
+app = modal.App("image-classifier", image=image)
 
-@env.task
-async def load_data() -> flyte.io.File:
-    """Download the Beans dataset and save as tensors."""
+# Shared volume so `load_data` can hand the prepared tensors to `train`.
+data_volume = modal.Volume.from_name("image-classifier-data", create_if_missing=True)
+DATA_PATH = "/data"
+
+
+@app.function(cpu=2, memory=8192, timeout=1800, volumes={DATA_PATH: data_volume})
+def load_data() -> str:
+    """Download the Beans dataset and save as tensors to the shared volume."""
+    import torch
     from datasets import load_dataset
+    from torchvision import transforms
 
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -40,18 +39,24 @@ async def load_data() -> flyte.io.File:
         images.append(transform(sample["image"].convert("RGB")))
         labels.append(sample["labels"])
 
-    path = "/tmp/beans_data.pt"
+    path = f"{DATA_PATH}/beans_data.pt"
     torch.save({"images": torch.stack(images), "labels": torch.tensor(labels)}, path)
-    print(f"Saved {len(images)} samples")
-    return await flyte.io.File.from_local(path)
+    data_volume.commit()
+    print(f"Saved {len(images)} samples to {path}")
+    return path
 
 
-@env.task
-async def train(data: flyte.io.File, num_epochs: int = 3, lr: float = 0.001) -> flyte.io.File:
+@app.function(gpu="T4", memory=8192, timeout=1800, volumes={DATA_PATH: data_volume})
+def train(data_path: str, num_epochs: int = 3, lr: float = 0.001) -> bytes:
     """Fine-tune ResNet18 on the Beans dataset."""
+    import io
+
+    import torch
+    import torch.nn as nn
+    from torchvision import models
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data_path = await data.download()
     dataset = torch.load(data_path, weights_only=False)
     images, labels = dataset["images"].to(device), dataset["labels"].to(device)
     print(f"Training on {len(images)} images, {labels.unique().numel()} classes")
@@ -83,16 +88,25 @@ async def train(data: flyte.io.File, num_epochs: int = 3, lr: float = 0.001) -> 
         acc = correct / len(images) * 100
         print(f"Epoch {epoch + 1}/{num_epochs} — loss: {epoch_loss / len(images):.4f}, acc: {acc:.1f}%")
 
-    path = "/tmp/resnet_beans.pt"
-    torch.save(model.state_dict(), path)
-    return await flyte.io.File.from_local(path)
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    return buffer.getvalue()
 
 
-@env.task
-async def pipeline(num_epochs: int = 3) -> flyte.io.File:
+@app.function()
+def pipeline(num_epochs: int = 3) -> bytes:
     """Load data → Train model."""
-    data = await load_data()
-    model = await train(data, num_epochs=num_epochs)
-    return model
+    data_path = load_data.remote()
+    return train.remote(data_path, num_epochs=num_epochs)
 
-# uv run flyte run image_classifier.py pipeline --num_epochs 3
+
+@app.local_entrypoint()
+def main(num_epochs: int = 3):
+    model_bytes = pipeline.remote(num_epochs)
+    out = "resnet_beans.pt"
+    with open(out, "wb") as f:
+        f.write(model_bytes)
+    print(f"Wrote trained model to {out} ({len(model_bytes)} bytes)")
+
+
+# uv run modal run image_classifier.py --num-epochs 3

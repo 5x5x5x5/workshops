@@ -1,28 +1,26 @@
-import base64
-import torch
+import modal
 
-import flyte
-import flyte.io
-import flyte.report
-
-env = flyte.TaskEnvironment(
-    name="stable-diffusion",
-    image=(
-        flyte.Image.from_debian_base()
-        .with_commands(
-            [
-                "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124"
-            ]
-        )
-        .with_requirements("requirements.txt")
-    ),
-    resources=flyte.Resources(cpu=2, memory="8Gi", gpu=1),
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch",
+        "torchvision",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install("diffusers==0.31.0", "transformers==4.44.2", "accelerate")
 )
 
+app = modal.App("stable-diffusion", image=image)
 
-@env.task(report=True)
-async def generate(prompt: str, steps: int = 30) -> flyte.io.File:
+# Cache HuggingFace model weights across runs so the model is only downloaded once.
+hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
+HF_CACHE_PATH = "/root/.cache/huggingface"
+
+
+@app.function(gpu="A10G", timeout=600, volumes={HF_CACHE_PATH: hf_cache})
+def generate(prompt: str, steps: int = 30) -> bytes:
     """Generate an image from a text prompt using Stable Diffusion."""
+    import torch
     from diffusers import AutoPipelineForText2Image
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -36,17 +34,17 @@ async def generate(prompt: str, steps: int = 30) -> flyte.io.File:
 
     path = "/tmp/output.png"
     image.save(path)
-
     with open(path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-    await flyte.report.replace.aio(
-        f"<h2>Stable Diffusion</h2>"
-        f"<p><b>Prompt:</b> {prompt}</p>"
-        f'<img src="data:image/png;base64,{img_b64}" style="max-width:512px" />'
-    )
-    await flyte.report.flush.aio()
-
-    return await flyte.io.File.from_local(path)
+        return f.read()
 
 
-# uv run flyte run stable_diffusion.py generate --prompt "a cat astronaut floating in space, digital art"
+@app.local_entrypoint()
+def main(prompt: str = "a cat astronaut floating in space, digital art", steps: int = 30):
+    png = generate.remote(prompt, steps)
+
+    with open("output.png", "wb") as f:
+        f.write(png)
+    print(f"Wrote output.png ({len(png)} bytes) for prompt: {prompt!r}")
+
+
+# uv run modal run stable_diffusion.py --prompt "a cat astronaut floating in space, digital art"
