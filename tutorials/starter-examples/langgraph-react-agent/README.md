@@ -49,5 +49,5 @@ Logs and traces for each run are available in the [Modal dashboard](https://moda
 ## Notes
 
 - Dependencies are declared inline in the `modal.Image`, so the only local requirement is `modal`
-- `utils/file_viewer.py` is a notebook display helper used by the companion notebook
-- The companion notebook `tutorial_langgraph_react_agent.ipynb` still uses the Flyte SDK and has not been ported
+- `tutorial_langgraph_react_agent.ipynb` is a step-by-step notebook version of this tutorial (runs on Modal)
+- `utils/file_viewer.py` is a notebook display helper used by that notebook
