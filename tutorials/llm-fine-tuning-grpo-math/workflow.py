@@ -21,28 +21,24 @@ differences:
 
 Usage:
     # Quick sanity check
-    flyte run workflow.py pipeline --model_name "Qwen/Qwen2.5-0.5B-Instruct" \\
-        --max_train_samples 20 --epochs 1 --num_generations 2 --batch_size 2 \\
-        --max_completion_length 128 --num_eval_examples 8
+    modal run workflow.py --model-name "Qwen/Qwen2.5-0.5B-Instruct" \\
+        --max-train-samples 20 --epochs 1 --num-generations 2 --batch-size 2 \\
+        --max-completion-length 128 --num-eval-examples 8
 
     # Workshop run (single T4, ~20-30 min)
-    flyte run workflow.py pipeline
+    modal run workflow.py
 
     # Full fine-tuning (no LoRA)
-    flyte run workflow.py pipeline --method full
+    modal run workflow.py --method full
 """
 
-import asyncio
 import json
 import logging
 import os
 import re
-import tempfile
+import shutil
 
-import flyte
-import flyte.io
-import flyte.report
-from config import cpu_env, gpu_env, HF_TOKEN
+from config import app, hf_secret, vol, DATA_PATH, GPU, GPU_MEMORY, CPU_MEMORY
 from report_helpers import make_bar_chart, make_line_chart, pipeline_step_indicator, wrap_report
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s", force=True)
@@ -109,17 +105,19 @@ def is_correct(completion_text: str, gold: str) -> bool:
 # Task 1: Prepare dataset
 # ------------------------------------------------------------------
 
-@cpu_env.task(cache="auto")
+@app.function(cpu=2, memory=CPU_MEMORY, timeout=1800, volumes={DATA_PATH: vol})
 async def prepare_data(
     dataset_name: str = DEFAULT_DATASET,
     max_train_samples: int = 200,
     max_eval_samples: int = 200,
-) -> flyte.io.Dir:
+) -> str:
     """Load GSM8K and build (question, gold-answer) train/eval splits.
 
     GSM8K columns: question, answer. The gold answer is the number after the
     '####' marker in the reference solution. We keep the raw question and the
     gold number; the conversational prompt is assembled at train time.
+
+    Writes the processed splits to the shared volume and returns the path.
     """
     from datasets import Dataset, DatasetDict, load_dataset
 
@@ -171,21 +169,23 @@ async def prepare_data(
         "eval": Dataset.from_list(eval_rows[:n_eval]),
     })
 
-    output_dir = os.path.join(tempfile.mkdtemp(), "dataset")
+    output_dir = os.path.join(DATA_PATH, "dataset")
+    shutil.rmtree(output_dir, ignore_errors=True)
     processed.save_to_disk(output_dir)
+    vol.commit()
     log.info(f"Dataset ready: {n_train} train, {n_eval} eval")
 
-    return await flyte.io.Dir.from_local(output_dir)
+    return output_dir
 
 
 # ------------------------------------------------------------------
 # Task 2: Train with GRPO
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(gpu=GPU, memory=GPU_MEMORY, timeout=3600, volumes={DATA_PATH: vol}, secrets=[hf_secret])
 async def train(
     model_name: str,
-    data_dir: flyte.io.Dir,
+    data_path: str,
     method: str = "lora",
     epochs: int = 1,
     lr: float = 1e-5,
@@ -195,8 +195,11 @@ async def train(
     lora_r: int = 16,
     lora_alpha: int = 32,
     beta: float = 0.005,
-) -> flyte.io.Dir:
+) -> tuple[str, str]:
     """Fine-tune a model with GRPO — reward = did it reach the right answer?
+
+    Saves the trained model to the shared volume and returns
+    ``(model_dir, training_report_html)``.
 
     Args:
         beta: KL penalty coefficient anchoring the policy to the base model.
@@ -208,6 +211,8 @@ async def train(
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
     from trl import GRPOConfig, GRPOTrainer
 
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+
     log.info(f"GRPO Math Training: model={model_name}, method={method}")
 
     if torch.cuda.is_available():
@@ -215,25 +220,7 @@ async def train(
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
         log.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
-    method_badge = (
-        '<span class="badge badge-info">GRPO + LoRA</span>' if method == "lora"
-        else '<span class="badge badge-danger">GRPO + Full Fine-Tune</span>'
-    )
-
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Loading Model...</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="card">'
-            f"<p><b>Method:</b> {method_badge}</p>"
-            f"<p>Setting up math reasoning training...</p>"
-            f"</div>"
-        ),
-        do_flush=True,
-    )
-
     # -- Load data --
-    data_path = await data_dir.download()
     dataset = load_from_disk(data_path)
 
     # -- Load model + tokenizer --
@@ -286,80 +273,8 @@ async def train(
     training_log: list[dict] = []
     reward_log: list[dict] = []
     reward_stats = {"calls": 0, "correct": 0, "total": 0}
-    loop = asyncio.get_running_loop()
 
-    def _build_training_report(max_steps: int) -> str:
-        stats_html = f"""
-        <h2>GRPO Math Training in Progress...</h2>
-        <h3>{model_name}</h3>
-        <div class="stat-grid">
-          <div class="stat"><div class="value">GRPO + {method.upper()}</div><div class="label">Method</div></div>
-          <div class="stat"><div class="value">{len(train_ds):,}</div><div class="label">Train Examples</div></div>
-          <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>
-          <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>
-          <div class="stat"><div class="value">{num_generations}</div><div class="label">Generations</div></div>
-          <div class="stat"><div class="value">{batch_size}</div><div class="label">Batch Size</div></div>
-        </div>
-        """
-
-        charts_html = ""
-
-        if training_log:
-            current = training_log[-1]
-            progress_pct = current["step"] / max_steps * 100 if max_steps else 0
-            loss_display = f"Loss: <span class=\"highlight\">{current['loss']:.4f}</span>" if current.get("loss") else ""
-            charts_html += f"""
-            <div class="card">
-              <b>Step {current['step']}/{max_steps}</b>
-              ({progress_pct:.0f}%) |
-              Epoch {current['epoch']:.2f}/{epochs}
-              {f' | {loss_display}' if loss_display else ''}
-              <div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">
-                <div style="background:#0f3460;width:{progress_pct:.1f}%;height:100%;border-radius:4px;"></div>
-              </div>
-            </div>
-            """
-
-            loss_entries = [e for e in training_log if "loss" in e]
-            if len(loss_entries) >= 2:
-                loss_chart = make_line_chart(
-                    data=loss_entries,
-                    x_key="epoch",
-                    y_keys=["loss"],
-                    title="Training Loss",
-                    x_label="Epoch",
-                    y_label="Loss",
-                    colors=["#5a7db5"],
-                )
-                charts_html += f'<div class="chart-container">{loss_chart}</div>'
-
-        if len(reward_log) >= 2:
-            acc = reward_stats["correct"] / max(reward_stats["total"], 1) * 100
-
-            charts_html += f"""
-            <div class="stat-grid" style="margin-top:16px;">
-              <div class="stat"><div class="value">{acc:.1f}%</div><div class="label">Answer Accuracy</div></div>
-              <div class="stat"><div class="value">{reward_stats['total']}</div><div class="label">Completions Scored</div></div>
-            </div>
-            """
-
-            acc_chart = make_line_chart(
-                data=reward_log,
-                x_key="batch",
-                y_keys=["accuracy", "batch_accuracy"],
-                title="Answer Accuracy (Reward)",
-                x_label="Reward Batch",
-                y_label="Accuracy %",
-                colors=["#06d6a0", "#5a7db5"],
-                y_max_cap=105.0,
-                y_display_names={"accuracy": "Running Avg", "batch_accuracy": "Per Batch"},
-            )
-            charts_html += f'<div class="chart-container">{acc_chart}</div>'
-
-        return wrap_report(stats_html + charts_html)
-
-    # -- Reward functions (sync + pure). They only record metrics; the callback
-    #    pushes report updates, so no cross-thread report calls are needed here. --
+    # -- Reward functions (sync + pure). They record metrics as training runs. --
     def accuracy_reward(completions, gold, **kwargs) -> list[float]:
         rewards = []
         batch_correct = 0
@@ -393,7 +308,7 @@ async def train(
             for c in completions
         ]
 
-    # -- Trainer callback for loss/progress + live report --
+    # -- Trainer callback for loss/progress logging --
     class MetricsCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -412,16 +327,9 @@ async def train(
                 f"epoch={entry['epoch']:.2f}"
                 + (f" loss={entry['loss']:.4f}" if "loss" in entry else "")
             )
-            asyncio.run_coroutine_threadsafe(
-                flyte.report.replace.aio(
-                    _build_training_report(state.max_steps),
-                    do_flush=True,
-                ),
-                loop,
-            )
 
     # -- GRPO config --
-    output_dir = os.path.join(tempfile.mkdtemp(), "checkpoints")
+    output_dir = os.path.join(DATA_PATH, "checkpoints")
     grpo_config = GRPOConfig(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -449,19 +357,15 @@ async def train(
     )
 
     log.info(f"Starting GRPO training (num_generations={num_generations})...")
-    await flyte.report.replace.aio(
-        _build_training_report(trainer.state.max_steps or 0),
-        do_flush=True,
-    )
-
-    await asyncio.to_thread(trainer.train)
+    trainer.train()
     log.info("Training loop finished.")
 
     final_acc = reward_stats["correct"] / max(reward_stats["total"], 1) * 100
     log.info(f"GRPO training complete. Train-time accuracy: {final_acc:.1f}%")
 
     # -- Save model --
-    save_dir = os.path.join(tempfile.mkdtemp(), "grpo_model")
+    save_dir = os.path.join(DATA_PATH, "grpo_model")
+    shutil.rmtree(save_dir, ignore_errors=True)
     if method == "lora":
         log.info("Merging LoRA weights...")
         merged_model = trainer.model.merge_and_unload()
@@ -470,9 +374,10 @@ async def train(
         log.info("Saving full model...")
         trainer.model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+    vol.commit()
     log.info("Model saved.")
 
-    # -- Final report --
+    # -- Build the training report (reward/loss charts) --
     final_charts = ""
     loss_entries = [e for e in training_log if "loss" in e]
     if len(loss_entries) >= 2:
@@ -490,47 +395,44 @@ async def train(
         )
         final_charts += f'<div class="chart-container">{acc_chart}</div>'
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>GRPO Math Training Complete</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{final_acc:.1f}%</div><div class="label">Train Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
-            f'  <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>'
-            f'</div>'
-            f"{final_charts}"
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>GRPO Math Training Complete</h2>"
+        f"<h3>{model_name}</h3>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{final_acc:.1f}%</div><div class="label">Train Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
+        f'  <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>'
+        f'</div>'
+        f"{final_charts}"
     )
 
-    return await flyte.io.Dir.from_local(save_dir)
+    return save_dir, report_html
 
 
 # ------------------------------------------------------------------
 # Task 3: Evaluate
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(gpu=GPU, memory=GPU_MEMORY, timeout=3600, volumes={DATA_PATH: vol}, secrets=[hf_secret])
 async def evaluate(
     model_name: str,
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
+    finetuned_dir: str,
+    data_path: str,
     num_examples: int = 40,
     max_new_tokens: int = 256,
-) -> str:
-    """Compare base vs GRPO-trained model on held-out GSM8K problems."""
+) -> tuple[str, str]:
+    """Compare base vs GRPO-trained model on held-out GSM8K problems.
+
+    Returns ``(metrics_json, eval_report_html)``.
+    """
     import torch
     from datasets import load_from_disk
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    log.info("Starting evaluation...")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Loading models...</p>"),
-        do_flush=True,
-    )
+    HF_TOKEN = os.environ.get("HF_TOKEN")
 
-    data_path = await data_dir.download()
+    log.info("Starting evaluation...")
+
     dataset = load_from_disk(data_path)
     eval_ds = dataset["eval"].select(range(min(num_examples, len(dataset["eval"]))))
 
@@ -568,9 +470,6 @@ async def evaluate(
 
     # -- Base model --
     log.info(f"Loading base model: {model_name}")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Running base model...</p>"), do_flush=True,
-    )
     base_model = AutoModelForCausalLM.from_pretrained(model_name, token=HF_TOKEN, dtype=dtype, device_map="auto")
     base_results = generate(base_model, questions)
     del base_model
@@ -579,11 +478,7 @@ async def evaluate(
 
     # -- GRPO model --
     log.info("Loading GRPO-trained model...")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Running GRPO-trained model...</p>"), do_flush=True,
-    )
-    ft_path = await finetuned_dir.download()
-    ft_model = AutoModelForCausalLM.from_pretrained(ft_path, dtype=dtype, device_map="auto")
+    ft_model = AutoModelForCausalLM.from_pretrained(finetuned_dir, dtype=dtype, device_map="auto")
     ft_results = generate(ft_model, questions)
     del ft_model
     if torch.cuda.is_available():
@@ -638,28 +533,25 @@ async def evaluate(
   GRPO: <span class="badge {ft_badge}">{c['grpo_pred']}</span></p>
 </div>"""
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Evaluation Results — GSM8K Math</h2>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{base_rate:.1f}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{ft_rate:.1f}%</div><div class="label">GRPO Accuracy</div></div>'
-            f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
-            f'  <div class="stat"><div class="value">{total}</div><div class="label">Problems Tested</div></div>'
-            f'</div>'
-            f'<div class="chart-container">{bar_chart}</div>'
-            f"<table>"
-            f"<tr><th></th><th>Answer Accuracy</th></tr>"
-            f"<tr><td><b>Base model</b></td><td>{base_rate:.1f}% ({base_correct}/{total})</td></tr>"
-            f"<tr><td><b>GRPO-trained</b></td><td>{ft_rate:.1f}% ({ft_correct}/{total})</td></tr>"
-            f"</table>"
-            f"<h3>Examples</h3>"
-            f"{examples_html}"
-        ),
-        do_flush=True,
+    eval_report_html = wrap_report(
+        f"<h2>Evaluation Results — GSM8K Math</h2>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{base_rate:.1f}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{ft_rate:.1f}%</div><div class="label">GRPO Accuracy</div></div>'
+        f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
+        f'  <div class="stat"><div class="value">{total}</div><div class="label">Problems Tested</div></div>'
+        f'</div>'
+        f'<div class="chart-container">{bar_chart}</div>'
+        f"<table>"
+        f"<tr><th></th><th>Answer Accuracy</th></tr>"
+        f"<tr><td><b>Base model</b></td><td>{base_rate:.1f}% ({base_correct}/{total})</td></tr>"
+        f"<tr><td><b>GRPO-trained</b></td><td>{ft_rate:.1f}% ({ft_correct}/{total})</td></tr>"
+        f"</table>"
+        f"<h3>Examples</h3>"
+        f"{examples_html}"
     )
 
-    return json.dumps({
+    metrics_json = json.dumps({
         "base_accuracy": round(base_rate, 1),
         "grpo_accuracy": round(ft_rate, 1),
         "improvement": round(ft_rate - base_rate, 1),
@@ -667,13 +559,15 @@ async def evaluate(
         "comparisons": comparisons[:15],
     })
 
+    return metrics_json, eval_report_html
+
 
 # ------------------------------------------------------------------
 # Pipeline
 # ------------------------------------------------------------------
 
-@cpu_env.task(report=True)
-async def pipeline(
+@app.function(cpu=2, memory=CPU_MEMORY, timeout=600)
+def pipeline(
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
     method: str = "lora",
     epochs: int = 1,
@@ -688,73 +582,103 @@ async def pipeline(
     lora_r: int = 16,
     lora_alpha: int = 32,
     beta: float = 0.005,
-) -> str:
+) -> dict:
     """
     GRPO fine-tuning pipeline — teach a model to solve GSM8K math.
 
     1. Prepare GSM8K (question + gold answer)
     2. Train with GRPO — reward = correct final answer
     3. Evaluate: accuracy before/after
+
+    Returns a dict with the combined HTML report and the eval metrics JSON.
     """
     log.info(f"Pipeline: {model_name} | GRPO math ({dataset_name})")
     steps = ["Prepare Data", "GRPO Train", "Evaluate"]
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>GRPO Math Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(0, steps)}"
-            f'<div class="card"><p>Preparing GSM8K problems...</p></div>'
-        ),
-        do_flush=True,
-    )
+    data_path = prepare_data.remote(dataset_name, max_train_samples, max_eval_samples)
 
-    data_dir = await prepare_data(dataset_name, max_train_samples, max_eval_samples)
-
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>GRPO Math Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(1, steps)}"
-            f'<div class="card"><p>GRPO training — reward = correct answer...</p></div>'
-        ),
-        do_flush=True,
-    )
-
-    finetuned_dir = await train(
-        model_name, data_dir, method, epochs, lr, batch_size,
+    model_dir, training_html = train.remote(
+        model_name, data_path, method, epochs, lr, batch_size,
         num_generations, max_completion_length, lora_r, lora_alpha, beta,
     )
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>GRPO Math Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(2, steps)}"
-            f'<div class="card"><p>Evaluating base vs GRPO model...</p></div>'
-        ),
-        do_flush=True,
+    metrics_json, eval_html = evaluate.remote(
+        model_name, model_dir, data_path, num_eval_examples, max_completion_length,
     )
-
-    result = await evaluate(model_name, finetuned_dir, data_dir, num_eval_examples, max_completion_length)
-    metrics = json.loads(result)
+    metrics = json.loads(metrics_json)
 
     improvement = metrics["improvement"]
     imp_badge = "badge-success" if improvement > 0 else "badge-danger" if improvement < 0 else "badge-info"
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>GRPO Math Pipeline Complete</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(3, steps)}"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{metrics["grpo_accuracy"]}%</div><div class="label">GRPO Accuracy</div></div>'
-            f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
-            f'</div>'
-        ),
-        do_flush=True,
+    summary_html = wrap_report(
+        f"<h2>GRPO Math Pipeline Complete</h2>"
+        f"<h3>{model_name}</h3>"
+        f"{pipeline_step_indicator(3, steps)}"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{metrics["grpo_accuracy"]}%</div><div class="label">GRPO Accuracy</div></div>'
+        f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
+        f'</div>'
     )
 
     log.info(f"Pipeline complete. Improvement: {improvement:+.1f}pp")
-    return result
+
+    # Concatenate the per-stage reports into one self-contained HTML artifact.
+    combined_html = summary_html + training_html + eval_html
+    return {"report_html": combined_html, "metrics": metrics_json}
+
+
+@app.local_entrypoint()
+def main(
+    model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+    method: str = "lora",
+    epochs: int = 1,
+    lr: float = 1e-5,
+    batch_size: int = 6,
+    num_generations: int = 6,
+    max_completion_length: int = 256,
+    dataset_name: str = DEFAULT_DATASET,
+    max_train_samples: int = 200,
+    max_eval_samples: int = 200,
+    num_eval_examples: int = 40,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+    beta: float = 0.005,
+):
+    """Run the GRPO math pipeline and write the HTML report + metrics locally."""
+    result = pipeline.remote(
+        model_name=model_name,
+        method=method,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        num_generations=num_generations,
+        max_completion_length=max_completion_length,
+        dataset_name=dataset_name,
+        max_train_samples=max_train_samples,
+        max_eval_samples=max_eval_samples,
+        num_eval_examples=num_eval_examples,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+        beta=beta,
+    )
+
+    report_path = "grpo_math_report.html"
+    with open(report_path, "w") as f:
+        f.write(result["report_html"])
+
+    metrics_path = "grpo_math_metrics.json"
+    with open(metrics_path, "w") as f:
+        f.write(result["metrics"])
+
+    metrics = json.loads(result["metrics"])
+    print(
+        f"Base: {metrics['base_accuracy']}%  |  "
+        f"GRPO: {metrics['grpo_accuracy']}%  |  "
+        f"Improvement: {metrics['improvement']:+.1f}pp"
+    )
+    print(f"Wrote report to {report_path}")
+    print(f"Wrote metrics to {metrics_path}")
+
+
+# uv run modal run workflow.py

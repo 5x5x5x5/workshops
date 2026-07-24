@@ -1,13 +1,13 @@
 # GRPO Fine-Tuning: Teach a Model to Solve Math
 
-Teach a small language model to solve grade-school math word problems (**GSM8K**) using **GRPO (Group Relative Policy Optimization)**. The reward is dead simple: did the model reach the correct final answer?
+Teach a small language model to solve grade-school math word problems (**GSM8K**) using **GRPO (Group Relative Policy Optimization)** on a GPU with [Modal](https://modal.com). The reward is dead simple: did the model reach the correct final answer?
 
-This is the sibling of [`llm-fine-tuning-grpo-code`](../llm-fine-tuning-grpo-code). Same RL technique (the one DeepSeek used for R1), same Flyte pipeline shape — but the task is math instead of code, so:
+This is the sibling of [`llm-fine-tuning-grpo-code`](../llm-fine-tuning-grpo-code). Same RL technique (the one DeepSeek used for R1), same three-stage pipeline shape — but the task is math instead of code, so:
 
 - **No sandbox.** The reward just parses the model's final number and compares it to the gold answer. Nothing untrusted is executed, so the whole thing is simpler and a bit faster.
 - **The dataset is already in the learnable zone.** Qwen2.5-0.5B-**Instruct** already solves ~30–40% of GSM8K, so GRPO has real signal to sharpen from step one — no difficulty-filtering pre-pass required.
 
-> **Why not a harder math set (e.g. DeepMath-103K)?** GRPO can only sharpen capability the base model *already has occasionally*. A 0.5B model scores ~0% on competition-level math — every completion fails, the reward is flat zero, and nothing is learned (the same "all-impossible" wall the code tutorial hits on raw MBPP). GSM8K is the sweet spot for a small model. You can point `--dataset_name` at a harder set to *demonstrate* that failure mode as a teaching contrast.
+> **Why not a harder math set (e.g. DeepMath-103K)?** GRPO can only sharpen capability the base model *already has occasionally*. A 0.5B model scores ~0% on competition-level math — every completion fails, the reward is flat zero, and nothing is learned (the same "all-impossible" wall the code tutorial hits on raw MBPP). GSM8K is the sweet spot for a small model. You can point `--dataset-name` at a harder set to *demonstrate* that failure mode as a teaching contrast.
 
 ## How GRPO Works
 
@@ -34,25 +34,29 @@ The key insight, same as the code tutorial: there's no single correct *derivatio
 ```
 ┌──────────────┐     ┌──────────────────┐     ┌────────────┐
 │ Prepare Data │────▶│   GRPO Training   │────▶│  Evaluate  │
-│  (CPU task)  │     │   (GPU task)      │     │ (GPU task) │
+│  (CPU func)  │     │   (GPU func)      │     │ (GPU func) │
 └──────────────┘     └──────────────────┘     └────────────┘
  GSM8K question       GRPO with answer-        Base vs fine-tuned
  + gold answer        correctness reward       accuracy on held-out
                       (LoRA or full)           test problems
 ```
 
+Each stage is a separate `@app.function` requesting exactly the resources it needs — the data-prep runs on CPU, training and evaluation on a T4 GPU. The prepared dataset and trained model are passed between functions through a shared `modal.Volume`.
+
 1. **Prepare data** — Downloads GSM8K and extracts each `(question, gold answer)` pair (the gold number is the value after the `####` marker in the reference solution).
 2. **Train with GRPO** — Fine-tunes an instruct model (LoRA by default). For each question it generates multiple solutions, parses the final answer, and rewards the ones that match gold. A light **format reward** nudges the model to put its answer in `\boxed{...}` so it's parseable.
 3. **Evaluate** — Runs held-out GSM8K problems through both the base and fine-tuned model, comparing accuracy side by side.
+
+The reward/loss charts and the base-vs-GRPO comparison are rendered as an SVG HTML report; the `local_entrypoint` writes it to `grpo_math_report.html` in your working directory, alongside a `grpo_math_metrics.json`.
 
 ## Files
 
 | File | What it does |
 |------|-------------|
-| `workflow.py` | Full pipeline — data prep, GRPO training, evaluation |
-| `config.py` | Flyte task environments (CPU/GPU), image config, secrets |
-| `report_helpers.py` | SVG chart generation and HTML styling for live reports |
-| `requirements.txt` | Python dependencies |
+| `workflow.py` | Full pipeline — data prep, GRPO training, evaluation, `local_entrypoint` |
+| `config.py` | Modal app, image, shared volume, GPU/CPU profiles, HF secret |
+| `report_helpers.py` | SVG chart generation and HTML styling for the report |
+| `requirements.txt` | Local dependency (just `modal` — everything else is in the image) |
 
 ## Setup
 
@@ -63,72 +67,86 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Set your HuggingFace token (optional for these ungated models, but keeps things smooth):
+## Modal account (one-time)
 
 ```bash
-echo "HF_TOKEN=hf_your_token_here" > .env
+uv run modal setup
 ```
+
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
+
+## HuggingFace secret
+
+The models here are ungated, but attaching a token keeps downloads smooth. The functions read `HF_TOKEN` from a Modal secret named `huggingface-secret`. Create it once:
+
+```bash
+uv run modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
+```
+
+(Or create it in the Modal dashboard under **Secrets** using the HuggingFace template.)
 
 ## Run
 
 ### Workshop run (single T4, ~20–30 min)
 
 ```bash
-flyte run workflow.py pipeline
+uv run modal run workflow.py
 ```
 
 Equivalent to the defaults:
 
 ```bash
-flyte run workflow.py pipeline \
-  --model_name "Qwen/Qwen2.5-0.5B-Instruct" \
+uv run modal run workflow.py \
+  --model-name "Qwen/Qwen2.5-0.5B-Instruct" \
   --method lora \
   --epochs 1 \
   --lr 1e-5 \
-  --batch_size 6 \
-  --num_generations 6 \
-  --max_completion_length 256 \
-  --max_train_samples 200 \
-  --max_eval_samples 200 \
-  --num_eval_examples 40
+  --batch-size 6 \
+  --num-generations 6 \
+  --max-completion-length 256 \
+  --max-train-samples 200 \
+  --max-eval-samples 200 \
+  --num-eval-examples 40
 ```
 
 Use the **Instruct** model, not the base — GSM8K needs the model to follow the "reason then answer" chat format, which the instruct tuning provides.
 
-> **Note:** `--batch_size` must be divisible by `--num_generations` (a GRPO requirement — each optimizer step processes whole generation groups). The defaults use `6` and `6`.
+> **Note:** `--batch-size` must be divisible by `--num-generations` (a GRPO requirement — each optimizer step processes whole generation groups). The defaults use `6` and `6`.
 
 ### Keep it from overfitting
 
 GRPO on a small model and a small dataset can **overfit**: the training-time accuracy climbs while held-out accuracy *drops*. Two knobs guard against it, both on by default:
 
 - `--beta 0.04` — KL penalty anchoring the policy to the base model so it can't drift far. Set higher (e.g. `0.1`) if you see the eval regress; `0` disables it.
-- `--epochs 1` — more epochs over the same small set is the fastest route to memorization. Add data (`--max_train_samples`) before adding epochs.
+- `--epochs 1` — more epochs over the same small set is the fastest route to memorization. Add data (`--max-train-samples`) before adding epochs.
 
 ### Quick sanity check
 
 ```bash
-flyte run workflow.py pipeline \
-  --max_train_samples 20 --epochs 1 \
-  --num_generations 2 --batch_size 2 \
-  --max_completion_length 128 --num_eval_examples 8
+uv run modal run workflow.py \
+  --max-train-samples 20 --epochs 1 \
+  --num-generations 2 --batch-size 2 \
+  --max-completion-length 128 --num-eval-examples 8
 ```
 
 ### Full fine-tuning (no LoRA)
 
 ```bash
-flyte run workflow.py pipeline --method full
+uv run modal run workflow.py --method full
 ```
 
 ### Bigger model
 
 ```bash
-flyte run workflow.py pipeline --model_name "Qwen/Qwen2.5-1.5B-Instruct"
+uv run modal run workflow.py --model-name "Qwen/Qwen2.5-1.5B-Instruct"
 ```
+
+If you move to a much larger model, bump the GPU in `config.py` (e.g. `GPU = "A100"`).
 
 ### Show the "too hard" failure mode (teaching contrast)
 
 ```bash
-flyte run workflow.py pipeline --dataset_name "trl-lib/DeepMath-103K"
+uv run modal run workflow.py --dataset-name "trl-lib/DeepMath-103K"
 ```
 
 Expect a flat ~0% reward — the base model can't solve competition math, so GRPO has nothing to sharpen. This is the point: **data curation matters more than the algorithm.**
@@ -137,20 +155,20 @@ Expect a flat ~0% reward — the base model can't solve competition math, so GRP
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model_name` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace model to fine-tune (use an **instruct** model) |
+| `--model-name` | `Qwen/Qwen2.5-0.5B-Instruct` | HuggingFace model to fine-tune (use an **instruct** model) |
 | `--method` | `lora` | `lora` for LoRA adapters, `full` for full fine-tuning |
 | `--epochs` | `1` | Training epochs (more = higher overfit risk) |
 | `--lr` | `1e-5` | Learning rate |
-| `--batch_size` | `6` | Completions per training step (must be divisible by `--num_generations`) |
-| `--num_generations` | `6` | Completions generated per prompt (the "Group" in GRPO) |
-| `--max_completion_length` | `256` | Max tokens per generated solution (math needs room to reason) |
+| `--batch-size` | `6` | Completions per training step (must be divisible by `--num-generations`) |
+| `--num-generations` | `6` | Completions generated per prompt (the "Group" in GRPO) |
+| `--max-completion-length` | `256` | Max tokens per generated solution (math needs room to reason) |
 | `--beta` | `0.04` | KL penalty vs. the base model — the main overfit guard |
-| `--dataset_name` | `openai/gsm8k` | Dataset to train on |
-| `--max_train_samples` | `200` | Number of training problems |
-| `--max_eval_samples` | `200` | Number of held-out eval problems |
-| `--num_eval_examples` | `40` | Problems used in the before/after comparison |
-| `--lora_r` | `16` | LoRA rank |
-| `--lora_alpha` | `32` | LoRA scaling factor |
+| `--dataset-name` | `openai/gsm8k` | Dataset to train on |
+| `--max-train-samples` | `200` | Number of training problems |
+| `--max-eval-samples` | `200` | Number of held-out eval problems |
+| `--num-eval-examples` | `40` | Problems used in the before/after comparison |
+| `--lora-r` | `16` | LoRA rank |
+| `--lora-alpha` | `32` | LoRA scaling factor |
 
 ## The Reward Function
 
@@ -174,6 +192,13 @@ Math is an ideal RL task for the same reasons code is:
 - **Objective reward** — a correct answer is an unambiguous, unhackable signal.
 - **In-reach for small models** — on GSM8K specifically, a 0.5B instruct model has enough of a foothold for RL to lift it.
 
+## Notes
+
+- **Resources per function** — `prepare_data` runs on CPU; `train` and `evaluate` request a T4 GPU (`GPU = "T4"` in `config.py`). The training code has an fp16 fallback for Turing GPUs that lack bf16.
+- **Artifacts between stages** — the prepared dataset and the merged/trained model are written to the `grpo-math` `modal.Volume` and handed to the next function by path.
+- **Dependencies** — declared inline in the `modal.Image` (Torch from the CUDA 12.4 wheels), so the only local requirement is `modal`.
+- **Report** — the SVG reward/loss charts and the base-vs-GRPO comparison are returned as HTML and written to `grpo_math_report.html` by the `local_entrypoint`.
+
 ## Further Reading
 
 - [DeepSeekMath](https://arxiv.org/abs/2402.03300) — introduces GRPO (group-relative advantages, no value network), originally *for math*.
@@ -189,7 +214,7 @@ The [code tutorial's Background section](../llm-fine-tuning-grpo-code#background
 |--|--|--|
 | Dataset | MBPP | GSM8K |
 | Reward | Tests pass (sandboxed) | Answer correct (parsed) |
-| Sandbox | Yes (`union.sandbox`) | No |
+| Sandbox | Yes | No |
 | Extra pre-pass | Learnability filter (MBPP is too hard raw) | None (GSM8K is already learnable) |
 | Best for | The "cool" demo — real code execution in a sandbox | A simple, reliable backup that trains fast |
 

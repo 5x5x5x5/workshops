@@ -1,4 +1,4 @@
-"""Flyte report helpers — CSS, SVG charts, and HTML wrappers."""
+"""Report helpers — CSS, SVG charts, and HTML wrappers."""
 
 REPORT_CSS = """
 <style>
