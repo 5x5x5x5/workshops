@@ -1,6 +1,6 @@
 # LLM Fine-Tuning: Text-to-SQL
 
-Fine-tune a language model on text-to-SQL with full fine-tuning, LoRA, or QLoRA — all in one Flyte pipeline. Then deploy the result as a FastAPI endpoint with a Gradio UI.
+Fine-tune a language model on text-to-SQL with full fine-tuning, LoRA, or QLoRA — all in one [Modal](https://modal.com) pipeline. Then serve the result as a FastAPI endpoint with a Gradio UI.
 
 **Default model:** [SmolLM2-135M](https://huggingface.co/HuggingFaceTB/SmolLM2-135M) — a tiny 135M parameter model. Small enough to train quickly on a single GPU, large enough to learn the SQL pattern and demonstrate the difference between fine-tuning methods.
 
@@ -12,28 +12,40 @@ Fine-tune a language model on text-to-SQL with full fine-tuning, LoRA, or QLoRA 
 
 | File | What it does |
 |------|-------------|
-| `config.py` | Flyte environments — CPU for data prep, GPU for training |
+| `config.py` | Modal app, image, HuggingFace secret, and shared volume |
 | `workflow.py` | Pipeline: prepare data → train (full/LoRA/QLoRA) → evaluate before/after |
 | `report_helpers.py` | Report CSS, SVG chart generators (line/bar), and HTML helpers |
-| `serve.py` | Deploy the fine-tuned model as a FastAPI endpoint |
+| `serve.py` | Serve the fine-tuned model as a FastAPI endpoint |
 | `app_gradio.py` | Gradio UI for interactive text-to-SQL queries |
 
 ## Setup
 
 ```bash
-cd tutorials/llm-fine-lora-qlora
+cd tutorials/llm-fine-tuning-lora-qlora
 
 uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Optional — set a HuggingFace token for gated models:
+## Modal account (one-time)
 
 ```bash
-export HF_TOKEN=your-token
-# or add HF_TOKEN=your-token to .env
+uv run modal setup
 ```
+
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
+
+## HuggingFace secret
+
+The training and serving functions read `HF_TOKEN` from a Modal secret named
+`huggingface-secret` (needed for gated models; optional otherwise). Create it once:
+
+```bash
+modal secret create huggingface-secret HF_TOKEN=hf_...
+```
+
+(Or create it in the Modal dashboard under **Secrets**.)
 
 ## How LoRA Works
 
@@ -75,53 +87,58 @@ These small corrections are applied at every key layer in every transformer bloc
 
 ## Run
 
+Each `modal run` executes the whole pipeline in the cloud on GPU. The
+fine-tuned model is written to the shared `lora-qlora` volume, and the
+training / evaluation / pipeline HTML reports are saved to your working
+directory (`training_report.html`, `evaluation_report.html`, `report.html`).
+
 ### LoRA (default)
 
 ```bash
-flyte run workflow.py pipeline --method lora
+modal run workflow.py --method lora
 ```
 
-### QLoRA (requires CUDA)
+### QLoRA
 
 ```bash
-flyte run --local --tui workflow.py pipeline --method qlora
+modal run workflow.py --method qlora
 ```
 
 ### Full fine-tuning
 
 ```bash
-flyte run --local --tui workflow.py pipeline --method full
+modal run workflow.py --method full
 ```
 
 ### Quick test (small subset)
 
 ```bash
-flyte run workflow.py pipeline \
-  --max_train_samples 100 --max_eval_samples 20 --epochs 3
+modal run workflow.py \
+  --max-train-samples 100 --max-eval-samples 20 --epochs 3
 ```
 
-### Remote (GPU cluster)
+### Swap model
 
 ```bash
-flyte run workflow.py pipeline \
-  --method lora --model_name "Qwen/Qwen2.5-0.5B" --epochs 3
+modal run workflow.py \
+  --method lora --model-name "Qwen/Qwen2.5-0.5B" --epochs 3
 ```
 
 ## Pipeline Parameters
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model_name` | `HuggingFaceTB/SmolLM2-135M` | HuggingFace model to fine-tune |
-| `--dataset_name` | `b-mc2/sql-create-context` | HuggingFace dataset |
+| `--model-name` | `HuggingFaceTB/SmolLM2-135M` | HuggingFace model to fine-tune |
+| `--dataset-name` | `b-mc2/sql-create-context` | HuggingFace dataset |
 | `--method` | `lora` | Fine-tuning method: `full`, `lora`, or `qlora` |
 | `--epochs` | `3` | Training epochs |
 | `--lr` | `2e-4` | Learning rate |
-| `--batch_size` | `4` | Per-device batch size |
-| `--max_train_samples` | `5000` | Max training examples |
-| `--max_eval_samples` | `500` | Max evaluation examples |
-| `--num_eval_examples` | `50` | Examples for before/after comparison |
-| `--lora_r` | `16` | LoRA rank (for lora/qlora) |
-| `--lora_alpha` | `32` | LoRA alpha (for lora/qlora) |
+| `--batch-size` | `4` | Per-device batch size |
+| `--max-train-samples` | `5000` | Max training examples |
+| `--max-eval-samples` | `500` | Max evaluation examples |
+| `--num-eval-examples` | `50` | Examples for before/after comparison |
+| `--lora-r` | `16` | LoRA rank (for lora/qlora) |
+| `--lora-alpha` | `32` | LoRA alpha (for lora/qlora) |
 
 ## Evaluation
 
@@ -135,28 +152,31 @@ The report shows the **full raw output** from each model. This is intentional �
 
 For scoring, `normalize_sql` extracts just the first SQL statement (truncating at `###` or newline) so the accuracy comparison is fair even when the base model keeps generating.
 
-Results appear as interactive Flyte reports with stat grids, SVG charts, and side-by-side comparisons.
+Results are written as self-contained HTML reports (`training_report.html`,
+`evaluation_report.html`, `report.html`) with stat grids, SVG charts, and
+side-by-side comparisons — open them in any browser. Live run logs and status
+are visible in the [Modal dashboard](https://modal.com/apps) or via `modal app list`.
 
-## Deploy the Fine-Tuned Model
+## Serve the Fine-Tuned Model
 
-After training, deploy as an OpenAI-compatible API:
+After training, the model sits on the `lora-qlora` volume. Serve it as a FastAPI endpoint:
 
 ```bash
-# Deploy the latest trained model
-python serve.py
+# Dev server with a live-reloading URL
+modal serve serve.py
 
-# Deploy a specific run (e.g. your best LoRA run)
-python serve.py --run-name rk2zfpk6x49c5vs45652
-
-# python serve.py --run-name <run-name>
+# Deploy a persistent endpoint
+modal deploy serve.py
 ```
 
-This deploys a FastAPI endpoint that loads the fine-tuned model and serves SQL generation. `RunOutput` pulls the model directory from your training pipeline.
+`serve.py` loads the model once per container (via `@modal.enter`) from the
+volume and serves SQL generation. The endpoint URLs are printed when you serve
+or deploy.
 
 Test the endpoint:
 
 ```bash
-curl -X POST https://steep-fog-ad9c2.apps.tryv2.hosted.unionai.cloud/generate \
+curl -X POST https://<your-workspace>--finetuned-sql-api-model-generate.modal.run \
   -H "Content-Type: application/json" \
   -d '{
     "schema": "CREATE TABLE employees (id INT, name VARCHAR, department VARCHAR, salary INT)",
@@ -175,14 +195,15 @@ Response:
 
 ## Gradio UI
 
-Deploy an interactive frontend for the model:
+Deploy an interactive frontend for the model. It loads the fine-tuned model
+directly from the volume — no separate server required:
 
 ```bash
-# Auto-discovers the deployed serve.py endpoint
-python app_gradio.py
+# Dev server with a live-reloading URL
+modal serve app_gradio.py
 
-# Or connect to a specific server
-SERVER_URL=https://your-app-url python app_gradio.py
+# Deploy a persistent URL
+modal deploy app_gradio.py
 ```
 
 Includes example schemas and questions to try out.
@@ -193,10 +214,10 @@ Everything is HuggingFace-based, so swapping is just changing a string:
 
 ```bash
 # Different model
-flyte run workflow.py pipeline --model_name "Qwen/Qwen2.5-0.5B"
+modal run workflow.py --model-name "Qwen/Qwen2.5-0.5B"
 
 # Different dataset (must have similar structure or update format_example in workflow.py)
-flyte run workflow.py pipeline --dataset_name "your-org/your-dataset"
+modal run workflow.py --dataset-name "your-org/your-dataset"
 ```
 
 ### LoRA target modules

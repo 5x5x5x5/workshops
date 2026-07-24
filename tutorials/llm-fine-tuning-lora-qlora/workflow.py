@@ -8,48 +8,42 @@ One pipeline, three fine-tuning methods. The `method` flag switches between:
 
 Usage:
     # LoRA fine-tuning (default)
-    flyte run --local --tui workflow.py pipeline
+    modal run workflow.py
 
-    # QLoRA (requires CUDA)
-    flyte run --local --tui workflow.py pipeline --method qlora
+    # QLoRA
+    modal run workflow.py --method qlora
 
     # Full fine-tuning with a small model
-    flyte run --local --tui workflow.py pipeline --method full
+    modal run workflow.py --method full
 
-    # Quick local test (few samples)
-    flyte run --local --tui workflow.py pipeline --max-train-samples 100 --max-eval-samples 20 --epochs 1
-
-    # Remote (GPU cluster)
-    flyte run workflow.py pipeline --method lora --epochs 3
+    # Quick test (few samples)
+    modal run workflow.py --max-train-samples 100 --max-eval-samples 20 --epochs 1
 """
 
-import asyncio
 import json
 import logging
-import os
-import tempfile
 
-import flyte
-import flyte.io
-import flyte.report
-from config import cpu_env, gpu_env, HF_TOKEN
+from config import DATA_PATH, app, hf_secret, vol
 from report_helpers import make_bar_chart, make_line_chart, pipeline_step_indicator, wrap_report
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s", force=True)
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
+DATASET_DIR = f"{DATA_PATH}/dataset"
+MODEL_DIR = f"{DATA_PATH}/finetuned_model"
+
 
 # ------------------------------------------------------------------
 # Task 1: Prepare dataset
 # ------------------------------------------------------------------
 
-@cpu_env.task(cache="auto")
-async def prepare_data(
+@app.function(cpu=2, memory=4096, volumes={DATA_PATH: vol}, timeout=3600)
+def prepare_data(
     dataset_name: str = "b-mc2/sql-create-context",
     max_train_samples: int = 5000,
     max_eval_samples: int = 500,
-) -> flyte.io.Dir:
+) -> str:
     """Download dataset from HuggingFace and format for instruction fine-tuning."""
     from datasets import DatasetDict, load_dataset
 
@@ -79,29 +73,42 @@ async def prepare_data(
         "eval": ds.select(range(eval_start, eval_end)),
     })
 
-    output_dir = os.path.join(tempfile.mkdtemp(), "dataset")
-    processed.save_to_disk(output_dir)
+    processed.save_to_disk(DATASET_DIR)
+    vol.commit()
     log.info(f"Dataset ready: {len(processed['train'])} train, {len(processed['eval'])} eval")
 
-    return await flyte.io.Dir.from_local(output_dir)
+    return DATASET_DIR
 
 
 # ------------------------------------------------------------------
 # Task 2: Train
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
-async def train(
+@app.function(
+    gpu="A100",
+    cpu=4,
+    memory=24576,
+    secrets=[hf_secret],
+    volumes={DATA_PATH: vol},
+    timeout=7200,
+)
+def train(
     model_name: str,
-    data_dir: flyte.io.Dir,
+    data_dir: str,
     method: str = "lora",
     epochs: int = 3,
     lr: float = 2e-4,
     batch_size: int = 4,
     lora_r: int = 16,
     lora_alpha: int = 32,
-) -> flyte.io.Dir:
-    """Fine-tune a model using full, LoRA, or QLoRA method."""
+) -> dict:
+    """Fine-tune a model using full, LoRA, or QLoRA method.
+
+    Returns the volume path of the saved model plus a self-contained HTML
+    training report (loss / learning-rate charts) for the caller to write out.
+    """
+    import os
+
     import torch
     from datasets import load_from_disk
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
@@ -109,28 +116,17 @@ async def train(
 
     log.info(f"Training: model={model_name}, method={method}")
 
+    HF_TOKEN = os.environ.get("HF_TOKEN")
+
     # -- Load data --
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    vol.reload()
+    dataset = load_from_disk(data_dir)
 
     # -- Load tokenizer --
     token_kwargs = {"token": HF_TOKEN} if HF_TOKEN else {}
     tokenizer = AutoTokenizer.from_pretrained(model_name, **token_kwargs)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    # -- Initial report: loading model --
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Loading Model...</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="card">'
-            f"<p><b>Method:</b> <span class=\"badge badge-info\">{method.upper()}</span></p>"
-            f"<p><b>Dataset:</b> {len(dataset['train']):,} train / {len(dataset['eval']):,} eval</p>"
-            f"</div>"
-        ),
-        do_flush=True,
-    )
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
@@ -189,9 +185,8 @@ async def train(
         trainable_params, total_params = model.get_nb_trainable_parameters()
         log.info(f"Trainable params: {trainable_params:,} / {total_params:,} ({trainable_params / total_params * 100:.1f}%)")
 
-    # -- Live training report state --
+    # -- Training log state (populated by the callback below) --
     training_log: list[dict] = []
-    loop = asyncio.get_running_loop()
 
     method_badge = f'<span class="badge badge-info">{method.upper()}</span>'
     if method == "qlora":
@@ -199,76 +194,7 @@ async def train(
     elif method == "full":
         method_badge = f'<span class="badge badge-danger">Full Fine-Tune</span>'
 
-    def _build_training_report(max_steps: int) -> str:
-        """Build the live training report HTML from current training_log."""
-        stats_html = f"""
-        <h2>Training in Progress...</h2>
-        <h3>{model_name}</h3>
-        <div class="stat-grid">
-          <div class="stat"><div class="value">{method.upper()}</div><div class="label">Method</div></div>
-          <div class="stat"><div class="value">{len(dataset['train']):,}</div><div class="label">Train Examples</div></div>
-          <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>
-          <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>
-          <div class="stat"><div class="value">{batch_size}</div><div class="label">Batch Size</div></div>
-          <div class="stat"><div class="value">{trainable_params / total_params * 100:.1f}%</div><div class="label">Trainable</div></div>
-        </div>
-        <p>Method: {method_badge} | Total params: {total_params:,} | Trainable: {trainable_params:,}</p>
-        """
-
-        charts_html = ""
-        if training_log:
-            current = training_log[-1]
-            progress_pct = current["step"] / max_steps * 100 if max_steps else 0
-            charts_html += f"""
-            <div class="card">
-              <b>Step {current['step']}/{max_steps}</b>
-              ({progress_pct:.0f}%) |
-              Epoch {current['epoch']:.2f}/{epochs} |
-              Loss: <span class="highlight">{current['loss']:.4f}</span>
-              <div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">
-                <div style="background:#0f3460;width:{progress_pct:.1f}%;height:100%;border-radius:4px;"></div>
-              </div>
-            </div>
-            """
-
-            loss_chart = make_line_chart(
-                data=training_log,
-                x_key="epoch",
-                y_keys=["loss"],
-                title="Training Loss",
-                x_label="Epoch",
-                y_label="Loss",
-                colors=["#5a7db5"],
-            )
-            charts_html += f'<div class="chart-container">{loss_chart}</div>'
-
-            if "lr" in training_log[0]:
-                lr_chart = make_line_chart(
-                    data=training_log,
-                    x_key="epoch",
-                    y_keys=["lr"],
-                    title="Learning Rate Schedule",
-                    x_label="Epoch",
-                    y_label="LR",
-                    colors=["#0f3460"],
-                )
-                charts_html += f'<div class="chart-container">{lr_chart}</div>'
-
-            if "grad_norm" in training_log[0]:
-                grad_chart = make_line_chart(
-                    data=training_log,
-                    x_key="epoch",
-                    y_keys=["grad_norm"],
-                    title="Gradient Norm",
-                    x_label="Epoch",
-                    y_label="Grad Norm",
-                    colors=["#06d6a0"],
-                )
-                charts_html += f'<div class="chart-container">{grad_chart}</div>'
-
-        return wrap_report(stats_html + charts_html)
-
-    # -- Metrics callback with live report updates --
+    # -- Metrics callback: accumulate per-step training metrics --
     class MetricsCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs or "loss" not in logs:
@@ -289,16 +215,8 @@ async def train(
                 f"loss={entry['loss']:.4f}"
             )
 
-            asyncio.run_coroutine_threadsafe(
-                flyte.report.replace.aio(
-                    _build_training_report(state.max_steps),
-                    do_flush=True,
-                ),
-                loop,
-            )
-
     # -- Train --
-    output_dir = os.path.join(tempfile.mkdtemp(), "checkpoints")
+    output_dir = "/tmp/checkpoints"
     training_args = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -323,19 +241,18 @@ async def train(
     )
 
     log.info("Starting training...")
-    await asyncio.to_thread(trainer.train)
+    trainer.train()
     log.info("Training complete.")
 
-    # -- Merge LoRA weights and save --
-    save_dir = os.path.join(tempfile.mkdtemp(), "finetuned_model")
-
+    # -- Merge LoRA weights and save to the shared volume --
     if method in ("lora", "qlora"):
         log.info("Merging LoRA weights into base model...")
         model = model.merge_and_unload()
 
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    log.info(f"Model saved to {save_dir}")
+    model.save_pretrained(MODEL_DIR)
+    tokenizer.save_pretrained(MODEL_DIR)
+    vol.commit()
+    log.info(f"Model saved to {MODEL_DIR}")
 
     # -- Final training report --
     final_loss = training_log[-1]["loss"] if training_log else "N/A"
@@ -362,58 +279,63 @@ async def train(
             colors=["#0f3460"],
         )
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Training Complete</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{method.upper()}</div><div class="label">Method</div></div>'
-            f'  <div class="stat"><div class="value">{final_loss}</div><div class="label">Final Loss</div></div>'
-            f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
-            f'  <div class="stat"><div class="value">{total_params:,}</div><div class="label">Total Params</div></div>'
-            f'  <div class="stat"><div class="value">{trainable_params:,}</div><div class="label">Trainable Params</div></div>'
-            f'  <div class="stat"><div class="value">{trainable_params / total_params * 100:.1f}%</div><div class="label">% Trainable</div></div>'
-            f'</div>'
-            f'<div class="chart-container">{loss_chart}</div>'
-            f'{f"""<div class="chart-container">{lr_chart}</div>""" if lr_chart else ""}'
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>Training Complete</h2>"
+        f"<h3>{model_name}</h3>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{method.upper()}</div><div class="label">Method</div></div>'
+        f'  <div class="stat"><div class="value">{final_loss}</div><div class="label">Final Loss</div></div>'
+        f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
+        f'  <div class="stat"><div class="value">{total_params:,}</div><div class="label">Total Params</div></div>'
+        f'  <div class="stat"><div class="value">{trainable_params:,}</div><div class="label">Trainable Params</div></div>'
+        f'  <div class="stat"><div class="value">{trainable_params / total_params * 100:.1f}%</div><div class="label">% Trainable</div></div>'
+        f'</div>'
+        f'<p>Method: {method_badge} | Total params: {total_params:,} | Trainable: {trainable_params:,}</p>'
+        f'<div class="chart-container">{loss_chart}</div>'
+        f'{f"""<div class="chart-container">{lr_chart}</div>""" if lr_chart else ""}'
     )
 
-    return await flyte.io.Dir.from_local(save_dir)
+    return {"model_dir": MODEL_DIR, "report_html": report_html}
 
 
 # ------------------------------------------------------------------
 # Task 3: Evaluate — before/after comparison
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
-async def evaluate(
+@app.function(
+    gpu="A100",
+    cpu=4,
+    memory=24576,
+    secrets=[hf_secret],
+    volumes={DATA_PATH: vol},
+    timeout=3600,
+)
+def evaluate(
     model_name: str,
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
+    finetuned_dir: str,
+    data_dir: str,
     num_examples: int = 50,
-) -> str:
-    """Compare base model vs fine-tuned model on test examples."""
+) -> dict:
+    """Compare base model vs fine-tuned model on test examples.
+
+    Returns the metrics dict plus a self-contained HTML evaluation report.
+    """
+    import os
+
     import torch
     from datasets import load_from_disk
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     log.info("Starting evaluation...")
-    await flyte.report.replace.aio(
-        wrap_report(
-            "<h2>Evaluation</h2>"
-            '<div class="card"><p>Loading models and running inference...</p></div>'
-        ),
-        do_flush=True,
-    )
+
+    HF_TOKEN = os.environ.get("HF_TOKEN")
 
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     dtype = torch.bfloat16 if use_bf16 else torch.float32
 
     # Load eval data
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    vol.reload()
+    dataset = load_from_disk(data_dir)
     eval_ds = dataset["eval"].select(range(min(num_examples, len(dataset["eval"]))))
 
     # Load tokenizer
@@ -451,21 +373,6 @@ async def evaluate(
 
     # -- Run base model --
     log.info(f"Loading base model: {model_name}")
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Evaluation</h2>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{len(eval_ds)}</div><div class="label">Eval Examples</div></div>'
-            f'  <div class="stat"><div class="value">1/2</div><div class="label">Phase</div></div>'
-            f'</div>'
-            f'<div class="card"><p>Running <b>base model</b> inference...</p>'
-            f'<div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">'
-            f'<div style="background:#adb5bd;width:25%;height:100%;border-radius:4px;"></div>'
-            f'</div></div>'
-        ),
-        do_flush=True,
-    )
-
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name, **token_kwargs, dtype=dtype, device_map="auto",
     )
@@ -477,17 +384,6 @@ async def evaluate(
         base_results.append(generated)
         if (i + 1) % 10 == 0:
             log.info(f"Base model: {i + 1}/{len(eval_ds)}")
-            pct = (i + 1) / len(eval_ds) * 50
-            await flyte.report.replace.aio(
-                wrap_report(
-                    f"<h2>Evaluation</h2>"
-                    f'<div class="card"><p>Running <b>base model</b> inference... {i + 1}/{len(eval_ds)}</p>'
-                    f'<div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">'
-                    f'<div style="background:#adb5bd;width:{pct:.0f}%;height:100%;border-radius:4px;"></div>'
-                    f'</div></div>'
-                ),
-                do_flush=True,
-            )
 
     del base_model
     if torch.cuda.is_available():
@@ -495,20 +391,8 @@ async def evaluate(
 
     # -- Run fine-tuned model --
     log.info("Loading fine-tuned model...")
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Evaluation</h2>"
-            f'<div class="card"><p>Running <b>fine-tuned model</b> inference...</p>'
-            f'<div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">'
-            f'<div style="background:#0f3460;width:50%;height:100%;border-radius:4px;"></div>'
-            f'</div></div>'
-        ),
-        do_flush=True,
-    )
-
-    ft_path = await finetuned_dir.download()
     ft_model = AutoModelForCausalLM.from_pretrained(
-        ft_path, dtype=dtype, device_map="auto",
+        finetuned_dir, dtype=dtype, device_map="auto",
     )
 
     ft_results = []
@@ -518,17 +402,6 @@ async def evaluate(
         ft_results.append(generated)
         if (i + 1) % 10 == 0:
             log.info(f"Fine-tuned model: {i + 1}/{len(eval_ds)}")
-            pct = 50 + (i + 1) / len(eval_ds) * 50
-            await flyte.report.replace.aio(
-                wrap_report(
-                    f"<h2>Evaluation</h2>"
-                    f'<div class="card"><p>Running <b>fine-tuned model</b> inference... {i + 1}/{len(eval_ds)}</p>'
-                    f'<div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">'
-                    f'<div style="background:#0f3460;width:{pct:.0f}%;height:100%;border-radius:4px;"></div>'
-                    f'</div></div>'
-                ),
-                do_flush=True,
-            )
 
     del ft_model
     if torch.cuda.is_available():
@@ -604,33 +477,32 @@ async def evaluate(
           </table>
         </div>"""
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Evaluation Results</h2>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{base_acc:.1f}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{ft_acc:.1f}%</div><div class="label">Fine-Tuned Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{improvement:+.1f}pp</div><div class="label">Improvement</div></div>'
-            f'  <div class="stat"><div class="value">{total}</div><div class="label">Eval Examples</div></div>'
-            f'</div>'
-            f'<div class="chart-container">{bar_chart}</div>'
-            f'<h3>Example Comparisons {improvement_badge}</h3>'
-            f'{examples_html}'
-            f'<div class="note">'
-            f'<b>Note:</b> Exact match accuracy compares normalized SQL output. '
-            f'The fine-tuned model may generate semantically correct queries that differ in formatting.'
-            f'</div>'
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>Evaluation Results</h2>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{base_acc:.1f}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{ft_acc:.1f}%</div><div class="label">Fine-Tuned Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{improvement:+.1f}pp</div><div class="label">Improvement</div></div>'
+        f'  <div class="stat"><div class="value">{total}</div><div class="label">Eval Examples</div></div>'
+        f'</div>'
+        f'<div class="chart-container">{bar_chart}</div>'
+        f'<h3>Example Comparisons {improvement_badge}</h3>'
+        f'{examples_html}'
+        f'<div class="note">'
+        f'<b>Note:</b> Exact match accuracy compares normalized SQL output. '
+        f'The fine-tuned model may generate semantically correct queries that differ in formatting.'
+        f'</div>'
     )
 
-    return json.dumps({
+    metrics = {
         "base_accuracy": round(base_acc, 1),
         "finetuned_accuracy": round(ft_acc, 1),
         "improvement": round(ft_acc - base_acc, 1),
         "num_examples": total,
         "comparisons": comparisons[:10],
-    })
+    }
+
+    return {"metrics": metrics, "report_html": report_html}
 
 
 # ------------------------------------------------------------------
@@ -638,8 +510,8 @@ async def evaluate(
 # ------------------------------------------------------------------
 
 
-@cpu_env.task(report=True)
-async def pipeline(
+@app.function(cpu=2, memory=4096, volumes={DATA_PATH: vol}, timeout=14400)
+def pipeline(
     model_name: str = "HuggingFaceTB/SmolLM2-135M",
     dataset_name: str = "b-mc2/sql-create-context",
     method: str = "lora",
@@ -651,7 +523,7 @@ async def pipeline(
     num_eval_examples: int = 50,
     lora_r: int = 16,
     lora_alpha: int = 32,
-) -> flyte.io.Dir:
+) -> dict:
     """
     End-to-end LLM fine-tuning pipeline.
 
@@ -659,7 +531,8 @@ async def pipeline(
     2. Fine-tune model (full / LoRA / QLoRA)
     3. Evaluate: before/after comparison on test set
 
-    Returns the fine-tuned model directory so it can be served directly.
+    Returns the fine-tuned model directory (on the shared volume) so it can be
+    served directly, plus the training / evaluation / pipeline HTML reports.
     """
     log.info(f"Pipeline: {model_name} | method={method} | dataset={dataset_name}")
     steps = ["Prepare Data", "Train", "Evaluate"]
@@ -667,46 +540,17 @@ async def pipeline(
     method_badge = f'<span class="badge badge-info">{method.upper()}</span>'
 
     # Step 1: Prepare data
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>LLM Fine-Tuning Pipeline</h2>"
-            f"<h3>{model_name} {method_badge}</h3>"
-            f'{pipeline_step_indicator(0, steps)}'
-            f'<div class="card"><p>Downloading and formatting dataset: <b>{dataset_name}</b>...</p></div>'
-        ),
-        do_flush=True,
-    )
-
-    data_dir = await prepare_data(dataset_name, max_train_samples, max_eval_samples)
+    data_dir = prepare_data.remote(dataset_name, max_train_samples, max_eval_samples)
 
     # Step 2: Train
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>LLM Fine-Tuning Pipeline</h2>"
-            f"<h3>{model_name} {method_badge}</h3>"
-            f'{pipeline_step_indicator(1, steps)}'
-            f'<div class="card"><p>Training in progress... check the <b>train</b> task report for live charts.</p></div>'
-        ),
-        do_flush=True,
-    )
-
-    finetuned_dir = await train(
+    train_result = train.remote(
         model_name, data_dir, method, epochs, lr, batch_size, lora_r, lora_alpha,
     )
+    finetuned_dir = train_result["model_dir"]
 
     # Step 3: Evaluate
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>LLM Fine-Tuning Pipeline</h2>"
-            f"<h3>{model_name} {method_badge}</h3>"
-            f'{pipeline_step_indicator(2, steps)}'
-            f'<div class="card"><p>Evaluating base vs fine-tuned model...</p></div>'
-        ),
-        do_flush=True,
-    )
-
-    result = await evaluate(model_name, finetuned_dir, data_dir, num_eval_examples)
-    metrics = json.loads(result)
+    eval_result = evaluate.remote(model_name, finetuned_dir, data_dir, num_eval_examples)
+    metrics = eval_result["metrics"]
 
     # Final pipeline report
     improvement = metrics["improvement"]
@@ -716,26 +560,78 @@ async def pipeline(
         else f'<span class="badge badge-danger">{improvement:.1f}pp</span>'
     )
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Pipeline Complete</h2>"
-            f"<h3>{model_name} {method_badge}</h3>"
-            f'{pipeline_step_indicator(3, steps)}'
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{metrics["finetuned_accuracy"]}%</div><div class="label">Fine-Tuned Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{improvement:+.1f}pp</div><div class="label">Improvement {improvement_badge}</div></div>'
-            f'  <div class="stat"><div class="value">{method.upper()}</div><div class="label">Method</div></div>'
-            f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
-            f'  <div class="stat"><div class="value">{metrics["num_examples"]}</div><div class="label">Eval Examples</div></div>'
-            f'</div>'
-            f'<div class="note">'
-            f'Check the <b>train</b> task report for training loss/LR charts, '
-            f'and the <b>evaluate</b> task report for detailed example comparisons.'
-            f'</div>'
-        ),
-        do_flush=True,
+    pipeline_report = wrap_report(
+        f"<h2>Pipeline Complete</h2>"
+        f"<h3>{model_name} {method_badge}</h3>"
+        f'{pipeline_step_indicator(3, steps)}'
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{metrics["finetuned_accuracy"]}%</div><div class="label">Fine-Tuned Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{improvement:+.1f}pp</div><div class="label">Improvement {improvement_badge}</div></div>'
+        f'  <div class="stat"><div class="value">{method.upper()}</div><div class="label">Method</div></div>'
+        f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
+        f'  <div class="stat"><div class="value">{metrics["num_examples"]}</div><div class="label">Eval Examples</div></div>'
+        f'</div>'
+        f'<div class="note">'
+        f'See <b>training_report.html</b> for training loss/LR charts, '
+        f'and <b>evaluation_report.html</b> for detailed example comparisons.'
+        f'</div>'
     )
 
     log.info(f"Pipeline complete. Improvement: {metrics['improvement']:+.1f}pp")
-    return finetuned_dir
+    return {
+        "model_dir": finetuned_dir,
+        "metrics": metrics,
+        "pipeline_report": pipeline_report,
+        "training_report": train_result["report_html"],
+        "evaluation_report": eval_result["report_html"],
+    }
+
+
+# ------------------------------------------------------------------
+# Local entrypoint — drives the pipeline and writes reports to disk
+# ------------------------------------------------------------------
+
+
+@app.local_entrypoint()
+def main(
+    model_name: str = "HuggingFaceTB/SmolLM2-135M",
+    dataset_name: str = "b-mc2/sql-create-context",
+    method: str = "lora",
+    epochs: int = 3,
+    lr: float = 2e-4,
+    batch_size: int = 4,
+    max_train_samples: int = 5000,
+    max_eval_samples: int = 500,
+    num_eval_examples: int = 50,
+    lora_r: int = 16,
+    lora_alpha: int = 32,
+):
+    """Run the full fine-tuning pipeline on Modal and save the reports locally."""
+    result = pipeline.remote(
+        model_name=model_name,
+        dataset_name=dataset_name,
+        method=method,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        max_train_samples=max_train_samples,
+        max_eval_samples=max_eval_samples,
+        num_eval_examples=num_eval_examples,
+        lora_r=lora_r,
+        lora_alpha=lora_alpha,
+    )
+
+    for fname, key in [
+        ("training_report.html", "training_report"),
+        ("evaluation_report.html", "evaluation_report"),
+        ("report.html", "pipeline_report"),
+    ]:
+        with open(fname, "w") as f:
+            f.write(result[key])
+        print(f"Wrote {fname}")
+
+    metrics = result["metrics"]
+    print(json.dumps({k: v for k, v in metrics.items() if k != "comparisons"}, indent=2))
+    print(f"Fine-tuned model saved to volume 'lora-qlora' at {result['model_dir']}")
+    print("Serve it with:  modal serve serve.py   (or  modal deploy serve.py)")

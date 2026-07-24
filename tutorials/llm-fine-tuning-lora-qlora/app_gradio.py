@@ -1,63 +1,43 @@
 """
-Text-to-SQL — Gradio frontend.
+Text-to-SQL — Gradio frontend on Modal.
 
-Type a question and schema, get a SQL query from the fine-tuned model
-served by serve.py.
+Type a question and a schema, get a SQL query from the fine-tuned model.
+The model is loaded once per container directly from the shared `lora-qlora`
+volume (written by workflow.py) — no separate server required.
 
 Usage:
-    # Deploy to cluster
-    python app_gradio.py
+    # Dev server with a live-reloading URL
+    modal serve app_gradio.py
 
-    # Local test (requires serve.py running)
-    SERVER_URL=https://your-app-url python app_gradio.py
+    # Deploy a persistent URL
+    modal deploy app_gradio.py
 """
 
-import logging
-import os
-import pathlib
+import modal
 
-import flyte
-import flyte.app
+from config import DATA_PATH, hf_secret, vol
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger(__name__)
+MODEL_DIR = f"{DATA_PATH}/finetuned_model"
 
-# ------------------------------------------------------------------
-# Image & environment
-# ------------------------------------------------------------------
-
-app_image = flyte.Image.from_debian_base(
-    name="sql-generator-gradio",
-).with_pip_packages(
-    "flyte[tui]>=2.0",
-    "gradio>=5.0.0",
-    "httpx",
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install(
+        "transformers>=4.45.0",
+        "accelerate>=0.34.0",
+        "gradio>=5.0.0",
+        "fastapi[standard]",
+    )
 )
 
-SERVER_APP_NAME = "finetuned-sql-api"
-
-gradio_env = flyte.app.AppEnvironment(
-    name="sql-generator-ui",
-    image=app_image,
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
-    requires_auth=False,
-    port=7860,
-    parameters=[
-        flyte.app.Parameter(
-            name="server_url",
-            value="",
-            env_var="SERVER_URL",
-        ),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=1800,
-    ),
-)
+app = modal.App("sql-generator-ui", image=image)
 
 
 # ------------------------------------------------------------------
-# Gradio app
+# Example schemas & questions
 # ------------------------------------------------------------------
 
 EXAMPLE_SCHEMAS = [
@@ -75,32 +55,61 @@ EXAMPLE_QUESTIONS = [
 ]
 
 
-@gradio_env.server
-def launch_app(server_url: str):
-    import gradio as gr
-    import httpx
+# ------------------------------------------------------------------
+# Gradio app served as an ASGI web endpoint
+# ------------------------------------------------------------------
 
-    api_url = server_url.rstrip("/")
-    log.info(f"Connecting to SQL server: {api_url}")
+@app.function(
+    gpu="A10G",
+    volumes={DATA_PATH: vol},
+    secrets=[hf_secret],
+    scaledown_window=1800,
+)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    import gradio as gr
+    import torch
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    # Load the fine-tuned model once per container.
+    vol.reload()
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, dtype=dtype, device_map="auto")
+    model.eval()
 
     def generate_sql(schema: str, question: str):
         if not question.strip():
             return "", "", "Please enter a question."
 
-        try:
-            response = httpx.post(
-                f"{api_url}/generate",
-                json={"schema": schema, "question": question},
-                timeout=30.0,
+        prompt = (
+            "### Task: Generate a SQL query to answer the question.\n"
+            f"### Schema:\n{schema}\n"
+            f"### Question:\n{question}\n"
+            "### SQL:\n"
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=128,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
             )
-            response.raise_for_status()
-            result = response.json()
-        except httpx.ConnectError:
-            return "", "", "Could not connect to the model server. Is it running?"
-        except Exception as e:
-            return "", "", f"Error: {e}"
+        raw = tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
+        ).strip()
 
-        return result["sql"], result["raw_output"], ""
+        sql = raw
+        for stop in ["###", "\n"]:
+            if stop in sql:
+                sql = sql[:sql.index(stop)]
+        sql = sql.strip()
+
+        return sql, raw, ""
 
     with gr.Blocks(title="Text-to-SQL Generator") as demo:
         gr.Markdown(
@@ -159,43 +168,4 @@ def launch_app(server_url: str):
             outputs=[sql_output, raw_output, error_output],
         )
 
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=os.environ.get("GRADIO_SHARE", "") == "1",
-        theme=gr.themes.Soft(),
-    )
-
-
-# ------------------------------------------------------------------
-# Deploy / local dev
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    server_url = os.environ.get("SERVER_URL", "")
-
-    if server_url:
-        launch_app(server_url)
-    else:
-        flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-
-        from flyte.remote._app import App
-
-        try:
-            server_app = App.get(SERVER_APP_NAME)
-            server_endpoint = server_app.endpoint
-            log.info(f"Found SQL server at: {server_endpoint}")
-        except Exception:
-            raise RuntimeError(
-                f"Could not find deployed app '{SERVER_APP_NAME}'. "
-                "Deploy the model server first with: python serve.py"
-            )
-
-        for p in gradio_env.parameters:
-            if p.name == "server_url":
-                p.value = server_endpoint
-                break
-
-        log.info("Deploying Gradio frontend...")
-        deployed = flyte.deploy(gradio_env)
-        log.info(f"Gradio app deployed: {deployed}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")
