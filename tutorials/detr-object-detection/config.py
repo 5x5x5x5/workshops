@@ -1,34 +1,49 @@
-import flyte
+"""Shared Modal image, app, and volumes for the RT-DETRv2 tutorial.
 
-# DGX Spark devbox specifics:
-#   - platform=linux/arm64 only — host is aarch64; QEMU-emulated amd64
-#     segfaults on `uv venv`.
-#   - registry="localhost:30000" — push to the devbox-local registry,
-#     not ghcr.io/flyteorg (which would 403).
-#   - extra_args="--index-strategy unsafe-best-match" — uv otherwise locks
-#     `torchmetrics` to whichever index it appears in first (the cu130
-#     index, which only has 1.0.3). The flag tells uv to consider all
-#     indexes for the best matching version.
-base_image = flyte.Image.from_debian_base(
-    name="rtdetr-detection-v1",
-    # registry="localhost:30000",
-    # platform=("linux/arm64",),
-).with_requirements(
-    "requirements.txt",
-    extra_args="--index-strategy unsafe-best-match",
+The image bundles PyTorch (CUDA 12.4 wheels), HuggingFace Transformers, and the
+detection/eval stack. All dependencies are declared inline — the only thing you
+need installed locally is `modal`.
+"""
+
+import modal
+
+# All training/eval/inference deps live inside the container image.
+#   - torch/torchvision from the CUDA 12.4 wheel index
+#   - fonts-dejavu-core so PIL can draw readable bounding-box labels
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("fonts-dejavu-core")
+    .pip_install(
+        "torch",
+        "torchvision",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install(
+        "transformers>=4.49.0",
+        "accelerate>=0.34.0",
+        "huggingface_hub>=0.24.0",
+        "datasets>=3.0.0",
+        "pillow>=10.0.0",
+        "albumentations>=1.4.0",
+        "torchmetrics>=1.4.0",
+        "pycocotools>=2.0.7",
+        "numpy",
+        "markdown",
+    )
 )
 
-gpu_env = flyte.TaskEnvironment(
-    name="rtdetr-detection-gpu",
-    image=base_image,
-    # Untyped gpu=1 — the GB10 node is labeled GB10, and a typed request
-    # like "L4:1" or "H100:1" would silently match nothing.
-    resources=flyte.Resources(cpu=4, memory="24Gi", gpu=1),
-)
+app = modal.App("rtdetr-detection", image=image)
 
-cpu_env = flyte.TaskEnvironment(
-    name="rtdetr-detection-cpu",
-    image=base_image,
-    resources=flyte.Resources(cpu=2, memory="6Gi"),
-    depends_on=[gpu_env],
-)
+# Shared volumes:
+#   - data_volume  holds the prepared COCO split (images/ + train.json + val.json)
+#     written by prepare_data and read by train/evaluate/inference_demo.
+#   - model_volume holds the fine-tuned model, written by train and read by the
+#     eval/demo tasks and by the detection server (app_server.py).
+data_volume = modal.Volume.from_name("rtdetr-data", create_if_missing=True)
+model_volume = modal.Volume.from_name("rtdetr-model", create_if_missing=True)
+
+DATA_PATH = "/data"
+MODEL_PATH = "/model"
+
+# Where the fine-tuned model is saved inside model_volume.
+FINETUNED_SUBDIR = "finetuned_model"

@@ -1,76 +1,75 @@
 """
-RT-DETR Object Detection — Gradio frontend.
+RT-DETR Object Detection — Gradio frontend on Modal.
 
-Upload images or use your webcam to detect objects with the fine-tuned
-RT-DETR model served by app_server.py.
+Upload images or use your webcam to detect objects with the fine-tuned RT-DETR
+model served by app_server.py. The UI talks to the detection server over HTTP.
 
 Usage:
-    # Deploy to cluster
-    python app_gradio.py
+    # Local dev with hot-reload (ephemeral URL)
+    uv run modal serve app_gradio.py
 
-    # Local test (requires app_server.py running on port 8080)
-    SERVER_URL=http://localhost:8080 python app_gradio.py
+    # Deploy a persistent URL
+    uv run modal deploy app_gradio.py
+
+The frontend auto-discovers the deployed detection server ("rtdetr-detection-server").
+Override with a SERVER_URL env var to point at a different endpoint.
 """
 
-import base64
-import io
 import logging
 import os
-import pathlib
 
-import flyte
-import flyte.app
+import modal
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# Image & environment
+# Image & app
 # ------------------------------------------------------------------
 
-app_image = flyte.Image.from_debian_base(
-    name="rtdetr-detection-gradio-v1",
-).with_pip_packages(
-    "flyte[tui]>=2.0",
+image = modal.Image.debian_slim(python_version="3.11").pip_install(
     "gradio>=5.0.0",
     "httpx",
     "pillow>=10.0.0",
+    "numpy",
+    "fastapi[standard]",
 )
 
-# The server app name — used to construct the cluster-internal URL.
+app = modal.App("rtdetr-detection-ui", image=image)
+
+# The deployed server app/class — used to look up the detection endpoint URL.
 SERVER_APP_NAME = "rtdetr-detection-server"
 
-gradio_env = flyte.app.AppEnvironment(
-    name="rtdetr-detection-ui",
-    image=app_image,
-    resources=flyte.Resources(cpu=2, memory="4Gi"),
-    requires_auth=False,
-    port=7860,
-    parameters=[
-        flyte.app.Parameter(
-            name="server_url",
-            value="",
-            env_var="SERVER_URL",
-        ),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=1800,
-    ),
-)
+
+def _resolve_server_url() -> str:
+    """Find the detection server URL: SERVER_URL env override, else Modal lookup."""
+    override = os.environ.get("SERVER_URL", "")
+    if override:
+        return override.rstrip("/")
+    server = modal.Cls.from_name(SERVER_APP_NAME, "Server")()
+    fn = server.fastapi_app
+    url = fn.get_web_url() if hasattr(fn, "get_web_url") else fn.web_url
+    return url.rstrip("/")
 
 
 # ------------------------------------------------------------------
 # Gradio app
 # ------------------------------------------------------------------
 
-@gradio_env.server
-def launch_app(server_url: str):
+@app.function(cpu=2, memory=4096)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    import base64
+    import io
+
     import gradio as gr
     import httpx
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
     from PIL import Image, ImageDraw, ImageFont
 
-    api_url = server_url.rstrip("/")
+    api_url = _resolve_server_url()
     log.info(f"Connecting to detection server: {api_url}")
 
     # -- Colors for different classes --
@@ -223,7 +222,7 @@ def launch_app(server_url: str):
         return annotated, summary
 
     # -- Build the Gradio UI --
-    with gr.Blocks(title="RT-DETR Object Detection") as demo:
+    with gr.Blocks(title="RT-DETR Object Detection", theme=gr.themes.Soft()) as demo:
         gr.Markdown(
             "# RT-DETR Object Detection\n"
             "Upload an image or use your webcam to detect objects "
@@ -291,45 +290,4 @@ def launch_app(server_url: str):
                 outputs=[webcam_output, webcam_details],
             )
 
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=os.environ.get("GRADIO_SHARE", "") == "1",
-        theme=gr.themes.Soft(),
-    )
-
-
-# ------------------------------------------------------------------
-# Deploy / local dev
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    server_url = os.environ.get("SERVER_URL", "")
-
-    if server_url:
-        # Local dev — connect to a running server
-        launch_app(server_url)
-    else:
-        # Deploy to cluster — auto-discover the server endpoint
-        flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-
-        from flyte.remote._app import App
-
-        try:
-            server_app = App.get(SERVER_APP_NAME)
-            server_endpoint = server_app.endpoint
-            log.info(f"Found detection server at: {server_endpoint}")
-        except Exception:
-            raise RuntimeError(
-                f"Could not find deployed app '{SERVER_APP_NAME}'. "
-                "Deploy the model server first with: python app_server.py"
-            )
-
-        for p in gradio_env.parameters:
-            if p.name == "server_url":
-                p.value = server_endpoint
-                break
-
-        log.info("Deploying Gradio frontend...")
-        deployed = flyte.deploy(gradio_env)
-        log.info(f"Gradio app deployed: {deployed}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")

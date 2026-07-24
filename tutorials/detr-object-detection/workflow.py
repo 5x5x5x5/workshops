@@ -3,23 +3,19 @@ RT-DETRv2 Object Detection — Fine-tune on a custom COCO dataset.
 
 Pipeline: download a COCO-format dataset from HuggingFace, fine-tune RT-DETRv2
 for object detection, evaluate with COCO mAP, and render an inference demo
-with bounding boxes drawn on held-out images.
+with bounding boxes drawn on held-out images — all on Modal.
 
 Usage:
     # Default (RT-DETRv2-R18 on Union swag stickers)
-    flyte run --local --tui workflow.py pipeline
+    uv run modal run workflow.py
 
-    # Quick local test
-    flyte run --local --tui workflow.py pipeline --epochs 1 --batch_size 2
-
-    # Remote
-    flyte run workflow.py pipeline --epochs 30
+    # Quick test
+    uv run modal run workflow.py --epochs 1 --batch-size 2
 
     # Swap model
-    flyte run workflow.py pipeline --model_name "PekingU/rtdetr_v2_r50vd"
+    uv run modal run workflow.py --model-name "PekingU/rtdetr_v2_r50vd"
 """
 
-import asyncio
 import base64
 import io
 import json
@@ -27,20 +23,30 @@ import logging
 import os
 import random
 import shutil
+import tarfile
 import tempfile
 
-import flyte
-import flyte.io
-import flyte.report
-from config import cpu_env, gpu_env
+import modal
+from config import (
+    DATA_PATH,
+    FINETUNED_SUBDIR,
+    MODEL_PATH,
+    app,
+    data_volume,
+    model_volume,
+)
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s", force=True)
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
+# HuggingFace token secret — injected as HF_TOKEN. Lets the pipeline pull gated
+# models or private datasets; harmless for the public defaults.
+hf_secret = modal.Secret.from_name("huggingface-secret")
+
 
 # ------------------------------------------------------------------
-# Report styling — shared CSS for all task reports
+# Report styling — shared CSS for all reports
 # ------------------------------------------------------------------
 
 REPORT_CSS = """
@@ -387,19 +393,36 @@ def _make_bar_chart(
     return "\n".join(lines_svg)
 
 
+def _tar_dir(src_dir: str) -> bytes:
+    """Tar+gzip a directory into bytes (for returning a model to the caller)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(src_dir, arcname=os.path.basename(src_dir))
+    return buf.getvalue()
+
+
 # ------------------------------------------------------------------
 # Task 1: Prepare dataset — download COCO JSON + images, split train/val
 # ------------------------------------------------------------------
 
-@cpu_env.task(cache="auto")
+@app.function(
+    cpu=2,
+    memory=6144,
+    timeout=1800,
+    volumes={DATA_PATH: data_volume},
+    secrets=[hf_secret],
+)
 async def prepare_data(
     dataset_repo: str = "sagecodes/union_flyte_swag_object_detection",
     annotations_path: str = "swag/train.json",
     images_subdir: str = "swag/images",
     val_fraction: float = 0.2,
     seed: int = 42,
-) -> flyte.io.Dir:
-    """Download a COCO-format dataset from HF and split into train/val."""
+) -> dict:
+    """Download a COCO-format dataset from HF and split into train/val.
+
+    Writes images/ + train.json + val.json into the shared data volume.
+    """
     from huggingface_hub import snapshot_download
 
     log.info(f"Downloading dataset: {dataset_repo}")
@@ -481,17 +504,24 @@ async def prepare_data(
         f"Split: {len(train_coco['images'])} train / {len(val_coco['images'])} val images"
     )
 
-    # Pack output dir: images/ + train.json + val.json
-    out_dir = tempfile.mkdtemp(prefix="coco_split_")
-    out_img = os.path.join(out_dir, "images")
+    # Pack into the data volume: images/ + train.json + val.json
+    out_img = os.path.join(DATA_PATH, "images")
+    if os.path.exists(out_img):
+        shutil.rmtree(out_img)
     shutil.copytree(img_root, out_img)
 
-    with open(os.path.join(out_dir, "train.json"), "w") as f:
+    with open(os.path.join(DATA_PATH, "train.json"), "w") as f:
         json.dump(train_coco, f)
-    with open(os.path.join(out_dir, "val.json"), "w") as f:
+    with open(os.path.join(DATA_PATH, "val.json"), "w") as f:
         json.dump(val_coco, f)
 
-    return await flyte.io.Dir.from_local(out_dir)
+    data_volume.commit()
+
+    return {
+        "num_train": len(train_coco["images"]),
+        "num_val": len(val_coco["images"]),
+        "categories": [c["name"] for c in categories],
+    }
 
 
 # ------------------------------------------------------------------
@@ -589,17 +619,27 @@ def _build_torch_dataset(coco_path: str, images_root: str, augment: bool):
 # Task 2: Train
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="A10G",
+    cpu=4,
+    memory=24576,
+    timeout=3600,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def train(
     model_name: str,
-    data_dir: flyte.io.Dir,
     epochs: int = 30,
     lr: float = 5e-5,
     batch_size: int = 4,
     weight_decay: float = 1e-4,
     eval_every_n_epochs: int | None = None,
-) -> flyte.io.Dir:
-    """Fine-tune RT-DETR (or any HuggingFace object-detection model) on COCO data."""
+) -> tuple[str, bytes]:
+    """Fine-tune RT-DETR (or any HuggingFace object-detection model) on COCO data.
+
+    Reads the prepared split from the data volume, saves the fine-tuned model into
+    the model volume, and returns (training_report_html, model_tar_gz_bytes).
+    """
     import torch
     from transformers import (
         AutoImageProcessor,
@@ -610,15 +650,11 @@ async def train(
     )
 
     log.info(f"Training: model={model_name}")
-    await flyte.report.replace.aio(_wrap_report(
-        f"<h2>Loading model...</h2><p>{model_name}</p>"
-        f"<p>Preparing dataset and initializing weights...</p>"
-    ), do_flush=True)
+    data_volume.reload()
 
     # -- Load data --
-    data_path = await data_dir.download()
-    images_root = os.path.join(data_path, "images")
-    train_json = os.path.join(data_path, "train.json")
+    images_root = os.path.join(DATA_PATH, "images")
+    train_json = os.path.join(DATA_PATH, "train.json")
 
     with open(train_json) as f:
         categories = json.load(f)["categories"]
@@ -629,7 +665,7 @@ async def train(
     log.info(f"Train examples: {len(train_ds)} | Categories: {id2label}")
 
     # -- Optionally load val set for periodic mAP evaluation --
-    val_json = os.path.join(data_path, "val.json")
+    val_json = os.path.join(DATA_PATH, "val.json")
     val_images = None
     val_targets = None
     if eval_every_n_epochs and os.path.exists(val_json):
@@ -701,92 +737,14 @@ async def train(
             f"{model.config.num_labels}. Check category id remapping in prepare_data."
         )
 
-    # -- Collect training metrics and update the report chart live.
-    # trainer.train() runs in a background thread (via asyncio.to_thread),
-    # so the asyncio event loop stays free. We use run_coroutine_threadsafe
-    # to push report updates from the callback thread onto that loop.
+    # -- Collect training metrics for the final report chart. --
     training_log: list[dict] = []
     eval_log: list[dict] = []  # periodic mAP checkpoints (epoch, map, map_50)
-    loop = asyncio.get_running_loop()
 
     cat_badges = " ".join(
         f'<span class="badge badge-info">{name}</span>'
         for name in id2label.values()
     )
-
-    def _build_training_report(max_steps: int) -> str:
-        """Build the live training report HTML from current training_log."""
-        stats_html = f"""
-        <h2>Training in Progress...</h2>
-        <h3>{model_name}</h3>
-        <div class="stat-grid">
-          <div class="stat"><div class="value">{len(train_ds)}</div><div class="label">Train Examples</div></div>
-          <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>
-          <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>
-          <div class="stat"><div class="value">{batch_size}</div><div class="label">Batch Size</div></div>
-          <div class="stat"><div class="value">{total_params:,}</div><div class="label">Total Params</div></div>
-          <div class="stat"><div class="value">{trainable_params / total_params * 100:.1f}%</div><div class="label">Trainable</div></div>
-        </div>
-        <p>Categories: {cat_badges}</p>
-        """
-
-        charts_html = ""
-        if training_log:
-            current = training_log[-1]
-            progress_pct = current["step"] / max_steps * 100 if max_steps else 0
-            charts_html += f"""
-            <div class="card">
-              <b>Step {current['step']}/{max_steps}</b>
-              ({progress_pct:.0f}%) |
-              Epoch {current['epoch']:.2f}/{epochs} |
-              Loss: <span class="highlight">{current['loss']:.4f}</span>
-              <div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">
-                <div style="background:#0f3460;width:{progress_pct:.1f}%;height:100%;border-radius:4px;"></div>
-              </div>
-            </div>
-            """
-
-            loss_chart = _make_line_chart(
-                data=training_log,
-                x_key="epoch",
-                y_keys=["loss"],
-                title="Training Loss",
-                x_label="Epoch",
-                y_label="Loss",
-                colors=["#5a7db5"],
-            )
-            charts_html += f'<div class="chart-container">{loss_chart}</div>'
-
-            if eval_every_n_epochs:
-                # Match x-axis to the loss chart: start at 0, end at current epoch
-                current_max_epoch = current["epoch"]
-                map_chart = _make_line_chart(
-                    data=eval_log,
-                    x_key="epoch",
-                    y_keys=["map", "map_50"],
-                    title="Validation mAP (periodic)",
-                    x_label="Epoch",
-                    y_label="mAP",
-                    colors=["#0f3460", "#06d6a0"],
-                    y_max_cap=1.0,
-                    y_display_names={"map": "mAP (0.50:0.95)", "map_50": "mAP@50"},
-                    x_range_override=(0, current_max_epoch),
-                )
-                charts_html += f'<div class="chart-container">{map_chart}</div>'
-
-            if "lr" in training_log[0]:
-                lr_chart = _make_line_chart(
-                    data=training_log,
-                    x_key="epoch",
-                    y_keys=["lr"],
-                    title="Learning Rate Schedule",
-                    x_label="Epoch",
-                    y_label="LR",
-                    colors=["#0f3460"],
-                )
-                charts_html += f'<div class="chart-container">{lr_chart}</div>'
-
-        return _wrap_report(stats_html + charts_html)
 
     class MetricsCallback(TrainerCallback):
         def __init__(self):
@@ -809,16 +767,6 @@ async def train(
                 f"step={state.global_step}/{state.max_steps} "
                 f"epoch={entry['epoch']:.2f} "
                 f"loss={entry['loss']:.4f}"
-            )
-
-            # Push a live report update onto the asyncio event loop.
-            # do_flush=True dispatches the update to the UI immediately.
-            asyncio.run_coroutine_threadsafe(
-                flyte.report.replace.aio(
-                    _build_training_report(state.max_steps),
-                    do_flush=True,
-                ),
-                loop,
             )
 
         def on_epoch_end(self, args, state, control, model=None, **kwargs):
@@ -856,14 +804,6 @@ async def train(
             })
             log.info(f"Epoch {current_epoch} — mAP: {map_val:.4f}, mAP@50: {map_50:.4f}")
 
-            asyncio.run_coroutine_threadsafe(
-                flyte.report.replace.aio(
-                    _build_training_report(state.max_steps),
-                    do_flush=True,
-                ),
-                loop,
-            )
-
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     output_dir = os.path.join(tempfile.mkdtemp(), "checkpoints")
     training_args = TrainingArguments(
@@ -891,14 +831,18 @@ async def train(
     )
 
     log.info("Starting training...")
-    # Run the sync HF training loop in a thread so the asyncio event loop
-    # stays free for Flyte's syncify bridge.
-    await asyncio.to_thread(trainer.train)
+    trainer.train()
     log.info("Training complete.")
 
-    save_dir = os.path.join(tempfile.mkdtemp(), "finetuned_model")
+    # Save the fine-tuned model into the shared model volume so the eval/demo
+    # tasks and the detection server can load it.
+    save_dir = os.path.join(MODEL_PATH, FINETUNED_SUBDIR)
+    if os.path.exists(save_dir):
+        shutil.rmtree(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
     trainer.save_model(save_dir)
     processor.save_pretrained(save_dir)
+    model_volume.commit()
     log.info(f"Model saved to {save_dir}")
 
     # -- Build final training report --
@@ -975,9 +919,10 @@ async def train(
         )
         charts_html += f'<div class="chart-container">{lr_chart}</div>'
 
-    await flyte.report.replace.aio(_wrap_report(stats_html + charts_html), do_flush=True)
+    report_html = _wrap_report(stats_html + charts_html)
+    model_tar = _tar_dir(save_dir)
 
-    return await flyte.io.Dir.from_local(save_dir)
+    return report_html, model_tar
 
 
 # ------------------------------------------------------------------
@@ -1046,26 +991,32 @@ def _img_to_data_uri(img, max_dim: int = 800) -> str:
 # Task 3: Evaluate — COCO mAP on fine-tuned model
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="A10G",
+    cpu=4,
+    memory=24576,
+    timeout=1800,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def evaluate(
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
     threshold: float = 0.5,
-) -> str:
-    """Compute COCO mAP for the fine-tuned model on the val split."""
+) -> tuple[str, str]:
+    """Compute COCO mAP for the fine-tuned model on the val split.
+
+    Returns (metrics_json, evaluation_report_html).
+    """
     import torch
     from PIL import Image
     from torchmetrics.detection.mean_ap import MeanAveragePrecision
     from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
     log.info("Starting evaluation...")
-    await flyte.report.replace.aio(_wrap_report(
-        "<h2>Evaluation</h2><p>Loading val split and scoring model...</p>"
-    ), do_flush=True)
+    data_volume.reload()
+    model_volume.reload()
 
-    data_path = await data_dir.download()
-    images_root = os.path.join(data_path, "images")
-    val_json = os.path.join(data_path, "val.json")
+    images_root = os.path.join(DATA_PATH, "images")
+    val_json = os.path.join(DATA_PATH, "val.json")
 
     with open(val_json) as f:
         val_coco = json.load(f)
@@ -1097,7 +1048,7 @@ async def evaluate(
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ft_path = await finetuned_dir.download()
+    ft_path = os.path.join(MODEL_PATH, FINETUNED_SUBDIR)
     log.info(f"Scoring fine-tuned model: {ft_path}")
     processor = AutoImageProcessor.from_pretrained(ft_path)
     model = AutoModelForObjectDetection.from_pretrained(ft_path).to(device)
@@ -1176,37 +1127,47 @@ async def evaluate(
     </div>
     """
 
-    await flyte.report.replace.aio(_wrap_report(eval_html), do_flush=True)
-
-    return json.dumps(
+    metrics_json = json.dumps(
         {
             "finetuned": {k: round(v, 4) for k, v in ft_metrics.items() if isinstance(v, (int, float))},
             "num_val_images": len(pil_images),
         }
     )
 
+    return metrics_json, _wrap_report(eval_html)
+
 
 # ------------------------------------------------------------------
 # Task 4: Inference demo — render bboxes on val images
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="A10G",
+    cpu=4,
+    memory=24576,
+    timeout=1800,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def inference_demo(
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
     threshold: float = 0.5,
     max_images: int = 8,
     metrics_json: str = "{}",
-) -> str:
-    """Run the fine-tuned model on val images, render bboxes, embed in the report."""
+) -> tuple[str, str]:
+    """Run the fine-tuned model on val images, render bboxes, embed in the report.
+
+    Returns (demo_json, inference_demo_html).
+    """
     import torch
     from PIL import Image
     from torchmetrics.detection.mean_ap import MeanAveragePrecision
     from transformers import AutoImageProcessor, AutoModelForObjectDetection
 
-    data_path = await data_dir.download()
-    images_root = os.path.join(data_path, "images")
-    val_json = os.path.join(data_path, "val.json")
+    data_volume.reload()
+    model_volume.reload()
+
+    images_root = os.path.join(DATA_PATH, "images")
+    val_json = os.path.join(DATA_PATH, "val.json")
 
     with open(val_json) as f:
         val_coco = json.load(f)
@@ -1239,7 +1200,7 @@ async def inference_demo(
             }
         )
 
-    ft_path = await finetuned_dir.download()
+    ft_path = os.path.join(MODEL_PATH, FINETUNED_SUBDIR)
     processor = AutoImageProcessor.from_pretrained(ft_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = AutoModelForObjectDetection.from_pretrained(ft_path).to(device)
@@ -1323,22 +1284,22 @@ async def inference_demo(
     {"".join(html_blocks)}
     """
 
-    await flyte.report.replace.aio(_wrap_report(demo_html), do_flush=True)
-
-    return json.dumps(
+    demo_json = json.dumps(
         {
             "num_images": len(pil_images),
             "predictions_per_image": [len(p["labels"]) for p in preds],
         }
     )
 
+    return demo_json, _wrap_report(demo_html)
+
 
 # ------------------------------------------------------------------
 # Pipeline
 # ------------------------------------------------------------------
 
-@cpu_env.task(report=True)
-async def pipeline(
+@app.function(timeout=5400)
+def pipeline(
     model_name: str = "PekingU/rtdetr_v2_r18vd",
     dataset_repo: str = "sagecodes/union_flyte_swag_object_detection",
     annotations_path: str = "swag/train.json",
@@ -1350,75 +1311,41 @@ async def pipeline(
     threshold: float = 0.5,
     demo_images: int = 8,
     eval_every_n_epochs: int | None = None,
-) -> tuple[flyte.io.Dir, str]:
+) -> dict:
     """
     End-to-end RT-DETRv2 fine-tuning pipeline.
 
-    Returns the fine-tuned model directory and a JSON summary.
-
     1. Download COCO dataset from HuggingFace and split train/val
     2. Fine-tune RT-DETRv2 on the train split
-    3. Evaluate: COCO mAP comparison (base vs fine-tuned)
+    3. Evaluate: COCO mAP on the val split
     4. Inference demo: render bounding boxes on val images
+
+    Returns a dict of report HTML, metrics, and the fine-tuned model tarball.
     """
     log.info(f"Pipeline: {model_name} | dataset={dataset_repo}")
 
-    def _pipeline_progress(step: int, label: str) -> str:
-        steps = ["Preparing Data", "Fine-tuning", "Evaluating", "Inference Demo"]
-        dots = ""
-        for i, s in enumerate(steps):
-            if i + 1 < step:
-                icon = '<span style="color:#06d6a0;">&#10003;</span>'
-            elif i + 1 == step:
-                icon = '<span style="color:#e94560;">&#9679;</span>'
-            else:
-                icon = '<span style="color:#adb5bd;">&#9675;</span>'
-            dots += f"<span style='margin:0 8px;'>{icon} {s}</span>"
-        return f"""
-        <h2>RT-DETRv2 Object Detection Pipeline</h2>
-        <p><b>Model:</b> {model_name} | <b>Dataset:</b> {dataset_repo}</p>
-        <div class="card" style="text-align:center;">{dots}</div>
-        <p>{label}</p>
-        """
-
-    await flyte.report.replace.aio(
-        _wrap_report(_pipeline_progress(1, "Downloading and splitting dataset...")),
-        do_flush=True,
-    )
-
-    data_dir = await prepare_data(
+    data_summary = prepare_data.remote(
         dataset_repo=dataset_repo,
         annotations_path=annotations_path,
         images_subdir=images_subdir,
         val_fraction=val_fraction,
     )
 
-    await flyte.report.replace.aio(
-        _wrap_report(_pipeline_progress(2, "Fine-tuning model...")),
-        do_flush=True,
-    )
-
-    finetuned_dir = await train(
-        model_name, data_dir, epochs, lr, batch_size,
+    training_report, model_tar = train.remote(
+        model_name,
+        epochs,
+        lr,
+        batch_size,
         eval_every_n_epochs=eval_every_n_epochs,
     )
 
-    await flyte.report.replace.aio(
-        _wrap_report(_pipeline_progress(3, "Running COCO mAP evaluation...")),
-        do_flush=True,
-    )
-
-    metrics_json = await evaluate(finetuned_dir, data_dir, threshold)
+    metrics_json, evaluation_report = evaluate.remote(threshold)
     metrics = json.loads(metrics_json)
 
-    await flyte.report.replace.aio(
-        _wrap_report(_pipeline_progress(4, "Rendering bounding box demo...")),
-        do_flush=True,
-    )
-
-    demo_json = await inference_demo(
-        finetuned_dir, data_dir, threshold, demo_images,
-        metrics_json=metrics_json,
+    demo_json, inference_report = inference_demo.remote(
+        threshold,
+        demo_images,
+        metrics_json,
     )
 
     ft_map = metrics["finetuned"].get("map", 0)
@@ -1438,7 +1365,78 @@ async def pipeline(
     </div>
     """
 
-    await flyte.report.replace.aio(_wrap_report(final_html), do_flush=True)
-
     log.info(f"Pipeline complete. Fine-tuned mAP: {ft_map:.3f}")
-    return finetuned_dir, json.dumps({"metrics": metrics, "demo": json.loads(demo_json)})
+
+    return {
+        "data_summary": data_summary,
+        "training_report": training_report,
+        "evaluation_report": evaluation_report,
+        "inference_demo": inference_report,
+        "pipeline_report": _wrap_report(final_html),
+        "metrics": metrics,
+        "demo": json.loads(demo_json),
+        "model_tar": model_tar,
+    }
+
+
+# ------------------------------------------------------------------
+# Local entrypoint
+# ------------------------------------------------------------------
+
+@app.local_entrypoint()
+def main(
+    model_name: str = "PekingU/rtdetr_v2_r18vd",
+    dataset_repo: str = "sagecodes/union_flyte_swag_object_detection",
+    annotations_path: str = "swag/train.json",
+    images_subdir: str = "swag/images",
+    epochs: int = 30,
+    lr: float = 5e-5,
+    batch_size: int = 4,
+    val_fraction: float = 0.2,
+    threshold: float = 0.5,
+    demo_images: int = 8,
+    eval_every_n_epochs: int | None = None,
+):
+    """Run the full pipeline on Modal and write outputs (model + reports) locally.
+
+    Modal has no built-in live-report UI, so the pipeline builds the same styled
+    HTML reports and writes them to local files here — open them in a browser.
+    """
+    result = pipeline.remote(
+        model_name=model_name,
+        dataset_repo=dataset_repo,
+        annotations_path=annotations_path,
+        images_subdir=images_subdir,
+        epochs=epochs,
+        lr=lr,
+        batch_size=batch_size,
+        val_fraction=val_fraction,
+        threshold=threshold,
+        demo_images=demo_images,
+        eval_every_n_epochs=eval_every_n_epochs,
+    )
+
+    # Write the styled HTML reports locally (the Modal stand-in for the live UI).
+    reports = {
+        "training_report.html": result["training_report"],
+        "evaluation_report.html": result["evaluation_report"],
+        "inference_demo.html": result["inference_demo"],
+        "pipeline_report.html": result["pipeline_report"],
+    }
+    for filename, html in reports.items():
+        with open(filename, "w") as f:
+            f.write(html)
+        print(f"Wrote {filename}")
+
+    # Extract the fine-tuned model tarball into ./finetuned_model/
+    model_tar = result["model_tar"]
+    with open("finetuned_model.tar.gz", "wb") as f:
+        f.write(model_tar)
+    with tarfile.open("finetuned_model.tar.gz", "r:gz") as tar:
+        tar.extractall(".")
+    print(f"Wrote fine-tuned model to ./{FINETUNED_SUBDIR}/ "
+          f"(also finetuned_model.tar.gz, {len(model_tar)} bytes)")
+
+    metrics = result["metrics"]["finetuned"]
+    print(f"\nFine-tuned mAP: {metrics.get('map', 0):.3f} | "
+          f"mAP@50: {metrics.get('map_50', 0):.3f}")
