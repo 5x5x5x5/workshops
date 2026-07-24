@@ -6,49 +6,38 @@ classification. The pipeline downloads the IMDB dataset, trains the model,
 and evaluates accuracy/F1 with example predictions.
 
 Usage:
-    # Default (ModernBERT-base on IMDB)
-    flyte run --local --tui workflow.py pipeline
-
     # Quick local test
-    flyte run --local --tui workflow.py pipeline --max_train_samples 200 --max_eval_samples 50 --epochs 1
+    uv run modal run workflow.py --max-train-samples 200 --max-eval-samples 50 --epochs 1
 
-    # Remote
-    flyte run workflow.py pipeline --epochs 3
+    # Default (ModernBERT-base on IMDB)
+    uv run modal run workflow.py --epochs 3
 
     # Swap model
-    flyte run workflow.py pipeline --model_name "bert-base-uncased"
+    uv run modal run workflow.py --model-name "bert-base-uncased"
 """
 
 import json
 import logging
 import os
-import tempfile
 
-import flyte
-import flyte.report
-import markdown
-from config import cpu_env, gpu_env, HF_TOKEN
+from config import DATA_PATH, app, data_volume, hf_secret
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s", force=True)
 log = logging.getLogger(__name__)
 log.setLevel(logging.INFO)
 
 
-def md_to_html(text: str) -> str:
-    return markdown.markdown(text, extensions=["tables", "fenced_code"])
-
-
 # ------------------------------------------------------------------
-# Task 1: Prepare dataset
+# Function 1: Prepare dataset
 # ------------------------------------------------------------------
 
-@cpu_env.task(cache="auto")
-async def prepare_data(
+@app.function(cpu=2, memory=4096, timeout=1800, volumes={DATA_PATH: data_volume})
+def prepare_data(
     dataset_name: str = "imdb",
     max_train_samples: int = 10000,
     max_eval_samples: int = 2000,
-) -> flyte.io.Dir:
-    """Download IMDB dataset and save splits to disk."""
+) -> str:
+    """Download IMDB dataset and save splits to the shared volume."""
     from datasets import DatasetDict, load_dataset
 
     log.info(f"Loading dataset: {dataset_name}")
@@ -59,25 +48,33 @@ async def prepare_data(
 
     processed = DatasetDict({"train": train_ds, "eval": eval_ds})
 
-    output_dir = os.path.join(tempfile.mkdtemp(), "dataset")
+    output_dir = f"{DATA_PATH}/dataset"
     processed.save_to_disk(output_dir)
+    data_volume.commit()
     log.info(f"Dataset ready: {len(train_ds)} train, {len(eval_ds)} eval")
 
-    return await flyte.io.Dir.from_local(output_dir)
+    return output_dir
 
 
 # ------------------------------------------------------------------
-# Task 2: Train
+# Function 2: Train
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
-async def train(
+@app.function(
+    gpu="T4",
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+    volumes={DATA_PATH: data_volume},
+    secrets=[hf_secret],
+)
+def train(
     model_name: str,
-    data_dir: flyte.io.Dir,
+    data_dir: str,
     epochs: int = 3,
     lr: float = 2e-5,
     batch_size: int = 16,
-) -> flyte.io.Dir:
+) -> dict:
     """Fine-tune a BERT-style model for sentiment classification."""
     import torch
     from datasets import load_from_disk
@@ -89,17 +86,15 @@ async def train(
         TrainingArguments,
     )
 
+    hf_token = os.environ.get("HF_TOKEN")
     log.info(f"Training: model={model_name}")
 
-    await flyte.report.replace.aio(f"<h2>Loading model: {model_name}</h2>")
-    await flyte.report.flush.aio()
-
     # -- Load data --
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    data_volume.reload()
+    dataset = load_from_disk(data_dir)
 
     # -- Tokenize --
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     def tokenize(examples):
         return tokenizer(examples["text"], truncation=True, max_length=512, padding="max_length")
@@ -111,7 +106,7 @@ async def train(
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        token=HF_TOKEN,
+        token=hf_token,
         num_labels=2,
         id2label={0: "negative", 1: "positive"},
         label2id={"negative": 0, "positive": 1},
@@ -121,27 +116,25 @@ async def train(
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Parameters: {trainable_params:,} / {total_params:,} ({trainable_params / total_params * 100:.1f}%)")
 
-    # -- Flyte report callback --
-    class FlyteReportCallback(TrainerCallback):
+    # -- Collect training-loss history for the HTML report --
+    train_history: list[dict] = []
+
+    class HistoryCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs or "loss" not in logs:
                 return
-            loss = logs["loss"]
-            step = state.global_step
-            total = state.max_steps
-            pct = step / total * 100 if total else 0
-            epoch = logs.get("epoch", 0)
-
-            flyte.report.replace(
-                f"<h2>Training — {model_name}</h2>"
-                f"<p><b>Step:</b> {step}/{total} ({pct:.0f}%) | "
-                f"<b>Epoch:</b> {epoch:.1f} | "
-                f"<b>Loss:</b> {loss:.4f}</p>"
+            train_history.append({
+                "step": state.global_step,
+                "epoch": round(logs.get("epoch", 0), 2),
+                "loss": round(logs["loss"], 4),
+            })
+            log.info(
+                f"Step {state.global_step}/{state.max_steps} | "
+                f"epoch {logs.get('epoch', 0):.1f} | loss {logs['loss']:.4f}"
             )
-            flyte.report.flush()
 
     # -- Train --
-    output_dir = os.path.join(tempfile.mkdtemp(), "checkpoints")
+    output_dir = f"{DATA_PATH}/checkpoints"
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -177,7 +170,7 @@ async def train(
         eval_dataset=dataset["eval"],
         processing_class=tokenizer,
         compute_metrics=compute_metrics,
-        callbacks=[FlyteReportCallback()],
+        callbacks=[HistoryCallback()],
     )
 
     log.info("Starting training...")
@@ -185,49 +178,54 @@ async def train(
     log.info("Training complete.")
 
     # -- Save --
-    save_dir = os.path.join(tempfile.mkdtemp(), "finetuned_model")
+    save_dir = f"{DATA_PATH}/finetuned_model"
     trainer.save_model(save_dir)
     tokenizer.save_pretrained(save_dir)
+    data_volume.commit()
     log.info(f"Model saved to {save_dir}")
 
-    # Final report
     metrics = trainer.evaluate()
-    await flyte.report.replace.aio(
-        f"<h2>Training Complete — {model_name}</h2>"
-        f"<p><b>Eval Accuracy:</b> {metrics.get('eval_accuracy', 0):.1%}</p>"
-        f"<p><b>Eval F1:</b> {metrics.get('eval_f1', 0):.1%}</p>"
-        f"<p><b>Epochs:</b> {epochs} | <b>LR:</b> {lr} | <b>Batch size:</b> {batch_size}</p>"
-    )
-    await flyte.report.flush.aio()
 
-    return await flyte.io.Dir.from_local(save_dir)
+    return {
+        "model_path": save_dir,
+        "train_history": train_history,
+        "eval_accuracy": round(metrics.get("eval_accuracy", 0) * 100, 1),
+        "eval_f1": round(metrics.get("eval_f1", 0) * 100, 1),
+        "epochs": epochs,
+        "lr": lr,
+        "batch_size": batch_size,
+    }
 
 
 # ------------------------------------------------------------------
-# Task 3: Evaluate — before/after comparison
+# Function 3: Evaluate — before/after comparison
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
-async def evaluate(
+@app.function(
+    gpu="T4",
+    memory=16384,
+    timeout=1800,
+    volumes={DATA_PATH: data_volume},
+    secrets=[hf_secret],
+)
+def evaluate(
     model_name: str,
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
+    finetuned_dir: str,
+    data_dir: str,
     num_examples: int = 100,
 ) -> str:
     """Compare base model vs fine-tuned model on test examples."""
-    import numpy as np
     import torch
     from datasets import load_from_disk
     from sklearn.metrics import accuracy_score, f1_score
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    hf_token = os.environ.get("HF_TOKEN")
     log.info("Starting evaluation...")
-    await flyte.report.replace.aio("<h2>Evaluation</h2><p>Loading models...</p>")
-    await flyte.report.flush.aio()
 
     # Load eval data (raw text + labels)
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    data_volume.reload()
+    dataset = load_from_disk(data_dir)
     eval_ds = dataset["eval"].select(range(min(num_examples, len(dataset["eval"]))))
 
     texts = eval_ds["text"]
@@ -247,12 +245,9 @@ async def evaluate(
 
     # -- Base model (untrained, random classifier head) --
     log.info(f"Loading base model: {model_name}")
-    await flyte.report.replace.aio("<h2>Evaluation</h2><p>Running base model inference...</p>")
-    await flyte.report.flush.aio()
-
-    base_tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+    base_tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, token=HF_TOKEN, num_labels=2,
+        model_name, token=hf_token, num_labels=2,
     )
     base_model.eval()
     if torch.cuda.is_available():
@@ -265,12 +260,8 @@ async def evaluate(
 
     # -- Fine-tuned model --
     log.info("Loading fine-tuned model...")
-    await flyte.report.replace.aio("<h2>Evaluation</h2><p>Running fine-tuned model inference...</p>")
-    await flyte.report.flush.aio()
-
-    ft_path = await finetuned_dir.download()
-    ft_tokenizer = AutoTokenizer.from_pretrained(ft_path)
-    ft_model = AutoModelForSequenceClassification.from_pretrained(ft_path)
+    ft_tokenizer = AutoTokenizer.from_pretrained(finetuned_dir)
+    ft_model = AutoModelForSequenceClassification.from_pretrained(finetuned_dir)
     ft_model.eval()
     if torch.cuda.is_available():
         ft_model = ft_model.cuda()
@@ -291,48 +282,18 @@ async def evaluate(
     log.info(f"Base model — Accuracy: {base_acc:.1f}%, F1: {base_f1:.1f}%")
     log.info(f"Fine-tuned — Accuracy: {ft_acc:.1f}%, F1: {ft_f1:.1f}%")
 
-    # -- Build report --
+    # -- Collect example comparisons for the report --
     comparisons = []
-    examples_html = ""
     for i in range(min(10, len(texts))):
         text_preview = texts[i][:300] + "..." if len(texts[i]) > 300 else texts[i]
-        true_label = label_names[labels[i]]
-        base_label = label_names[base_preds[i]]
-        ft_label = label_names[ft_preds[i]]
-
-        base_color = "green" if base_preds[i] == labels[i] else "red"
-        ft_color = "green" if ft_preds[i] == labels[i] else "red"
-
         comparisons.append({
             "text": text_preview,
-            "true_label": true_label,
-            "base_pred": base_label,
-            "ft_pred": ft_label,
+            "true_label": label_names[labels[i]],
+            "base_pred": label_names[base_preds[i]],
+            "ft_pred": label_names[ft_preds[i]],
             "base_correct": base_preds[i] == labels[i],
             "ft_correct": ft_preds[i] == labels[i],
         })
-
-        examples_html += f"""
-<div style="border:1px solid #ddd; padding:12px; margin:8px 0; border-radius:4px;">
-<p style="font-size:0.9em;">{text_preview}</p>
-<p><b>True:</b> {true_label} |
-<b>Base:</b> <span style="color:{base_color};">{base_label}</span> |
-<b>Fine-tuned:</b> <span style="color:{ft_color};">{ft_label}</span></p>
-</div>"""
-
-    await flyte.report.replace.aio(f"""
-<h2>Evaluation Results</h2>
-<table>
-<tr><th></th><th>Accuracy</th><th>F1</th></tr>
-<tr><td><b>Base model</b></td><td>{base_acc:.1f}%</td><td>{base_f1:.1f}%</td></tr>
-<tr><td><b>Fine-tuned</b></td><td>{ft_acc:.1f}%</td><td>{ft_f1:.1f}%</td></tr>
-</table>
-<p><b>Accuracy improvement:</b> {ft_acc - base_acc:+.1f} percentage points</p>
-<hr/>
-<h3>Example Predictions</h3>
-{examples_html}
-""")
-    await flyte.report.flush.aio()
 
     return json.dumps({
         "base_accuracy": round(base_acc, 1),
@@ -349,8 +310,8 @@ async def evaluate(
 # Pipeline
 # ------------------------------------------------------------------
 
-@cpu_env.task(report=True)
-async def pipeline(
+@app.function()
+def pipeline(
     model_name: str = "answerdotai/ModernBERT-base",
     dataset_name: str = "imdb",
     epochs: int = 3,
@@ -369,47 +330,118 @@ async def pipeline(
     """
     log.info(f"Pipeline: {model_name} | dataset={dataset_name}")
 
-    await flyte.report.replace.aio(
-        f"<h2>Sentiment Classification Pipeline</h2>"
-        f"<p><b>Model:</b> {model_name}</p>"
-        f"<p><b>Dataset:</b> {dataset_name}</p>"
-        f"<p>Step 1/3: Preparing data...</p>"
-    )
-    await flyte.report.flush.aio()
-
     # Step 1: Prepare data
-    data_dir = await prepare_data(dataset_name, max_train_samples, max_eval_samples)
+    data_dir = prepare_data.remote(dataset_name, max_train_samples, max_eval_samples)
 
     # Step 2: Train
-    await flyte.report.replace.aio(
-        f"<h2>Sentiment Classification Pipeline</h2>"
-        f"<p><b>Model:</b> {model_name}</p>"
-        f"<p>Step 2/3: Training...</p>"
-    )
-    await flyte.report.flush.aio()
-
-    finetuned_dir = await train(model_name, data_dir, epochs, lr, batch_size)
+    train_info = train.remote(model_name, data_dir, epochs, lr, batch_size)
 
     # Step 3: Evaluate
-    await flyte.report.replace.aio(
-        f"<h2>Sentiment Classification Pipeline</h2>"
-        f"<p><b>Model:</b> {model_name}</p>"
-        f"<p>Step 3/3: Evaluating...</p>"
-    )
-    await flyte.report.flush.aio()
-
-    result = await evaluate(model_name, finetuned_dir, data_dir, num_eval_examples)
+    result = evaluate.remote(model_name, train_info["model_path"], data_dir, num_eval_examples)
     metrics = json.loads(result)
 
-    # Final report
-    await flyte.report.replace.aio(
-        f"<h2>Pipeline Complete</h2>"
-        f"<p><b>Model:</b> {model_name}</p>"
-        f"<p><b>Base accuracy:</b> {metrics['base_accuracy']}%</p>"
-        f"<p><b>Fine-tuned accuracy:</b> {metrics['finetuned_accuracy']}%</p>"
-        f"<p><b>Improvement:</b> {metrics['accuracy_improvement']:+.1f} percentage points</p>"
-    )
-    await flyte.report.flush.aio()
-
     log.info(f"Pipeline complete. Improvement: {metrics['accuracy_improvement']:+.1f}pp")
-    return result
+
+    # Bundle everything the HTML report needs.
+    return json.dumps({
+        "model_name": model_name,
+        "dataset_name": dataset_name,
+        "train": train_info,
+        "eval": metrics,
+    })
+
+
+# ------------------------------------------------------------------
+# Report + local entrypoint
+# ------------------------------------------------------------------
+
+def build_report_html(payload: dict) -> str:
+    """Render the same content the training/eval reports produced, as HTML."""
+    model_name = payload["model_name"]
+    dataset_name = payload["dataset_name"]
+    train_info = payload["train"]
+    ev = payload["eval"]
+
+    # Training loss history rows.
+    history_rows = "".join(
+        f"<tr><td>{h['step']}</td><td>{h['epoch']:.1f}</td><td>{h['loss']:.4f}</td></tr>"
+        for h in train_info["train_history"]
+    )
+
+    # Example predictions block.
+    examples_html = ""
+    for c in ev["comparisons"]:
+        base_color = "green" if c["base_correct"] else "red"
+        ft_color = "green" if c["ft_correct"] else "red"
+        examples_html += f"""
+<div style="border:1px solid #ddd; padding:12px; margin:8px 0; border-radius:4px;">
+<p style="font-size:0.9em;">{c['text']}</p>
+<p><b>True:</b> {c['true_label']} |
+<b>Base:</b> <span style="color:{base_color};">{c['base_pred']}</span> |
+<b>Fine-tuned:</b> <span style="color:{ft_color};">{c['ft_pred']}</span></p>
+</div>"""
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Sentiment Classification Report</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem;">
+<h2>Sentiment Classification Pipeline</h2>
+<p><b>Model:</b> {model_name}</p>
+<p><b>Dataset:</b> {dataset_name}</p>
+
+<h2>Training Complete — {model_name}</h2>
+<p><b>Eval Accuracy:</b> {train_info['eval_accuracy']:.1f}%</p>
+<p><b>Eval F1:</b> {train_info['eval_f1']:.1f}%</p>
+<p><b>Epochs:</b> {train_info['epochs']} | <b>LR:</b> {train_info['lr']} | <b>Batch size:</b> {train_info['batch_size']}</p>
+<h3>Training Loss History</h3>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Step</th><th>Epoch</th><th>Loss</th></tr>
+{history_rows}
+</table>
+
+<hr/>
+<h2>Evaluation Results</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th></th><th>Accuracy</th><th>F1</th></tr>
+<tr><td><b>Base model</b></td><td>{ev['base_accuracy']:.1f}%</td><td>{ev['base_f1']:.1f}%</td></tr>
+<tr><td><b>Fine-tuned</b></td><td>{ev['finetuned_accuracy']:.1f}%</td><td>{ev['finetuned_f1']:.1f}%</td></tr>
+</table>
+<p><b>Accuracy improvement:</b> {ev['accuracy_improvement']:+.1f} percentage points</p>
+<hr/>
+<h3>Example Predictions</h3>
+{examples_html}
+</body></html>"""
+
+
+@app.local_entrypoint()
+def main(
+    model_name: str = "answerdotai/ModernBERT-base",
+    dataset_name: str = "imdb",
+    epochs: int = 3,
+    lr: float = 2e-5,
+    batch_size: int = 16,
+    max_train_samples: int = 10000,
+    max_eval_samples: int = 2000,
+    num_eval_examples: int = 100,
+):
+    result = pipeline.remote(
+        model_name,
+        dataset_name,
+        epochs,
+        lr,
+        batch_size,
+        max_train_samples,
+        max_eval_samples,
+        num_eval_examples,
+    )
+    payload = json.loads(result)
+
+    # Write the HTML report locally (Modal has no live report view).
+    report_path = "bert_sentiment_report.html"
+    with open(report_path, "w") as f:
+        f.write(build_report_html(payload))
+
+    ev = payload["eval"]
+    print(f"Base accuracy:       {ev['base_accuracy']}%")
+    print(f"Fine-tuned accuracy: {ev['finetuned_accuracy']}%")
+    print(f"Improvement:         {ev['accuracy_improvement']:+.1f} percentage points")
+    print(f"Wrote report to {report_path}")
