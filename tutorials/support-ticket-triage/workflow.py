@@ -1,32 +1,44 @@
 """Support Ticket Triage: LLM-powered classification with parallel fan-out.
 
-Scores a batch of support tickets using GPT-4o-mini in parallel,
-then ranks them and generates a visual triage report in the Flyte UI.
+Scores a batch of support tickets using GPT-4o-mini in parallel on Modal,
+then ranks them and generates a visual triage report written to disk.
 """
 
-import json
-import os
+import modal
 
-from dotenv import load_dotenv
-load_dotenv()
-
-import flyte
-import flyte.report
 from report_helpers import build_html
 
 # Environment configuration -------------------
-env = flyte.TaskEnvironment(
-    name="ticket_triage",
-    resources=flyte.Resources(cpu=1, memory="256Mi"),
-    image=flyte.Image.from_debian_base().with_requirements("requirements.txt"),
-    secrets=flyte.Secret(key="SAGE_OPENAI_API_KEY", as_env_var="OPENAI_API_KEY"),
+image = modal.Image.debian_slim(python_version="3.11").pip_install("openai")
+
+app = modal.App("ticket-triage", image=image)
+
+# Default batch of sample support tickets
+TICKETS = [
+    "URGENT: Production database is down, customers cannot log in",
+    "The export button gives an error when I click it",
+    "Love the new dashboard update, works great!",
+    "App has been slow and unresponsive for 2 days, very frustrated",
+    "Security breach detected — need immediate investigation",
+    "How do I reset my password?",
+    "Billing is wrong, I was charged twice. Want a refund",
+    "Great customer support, issue resolved quickly. Thanks!",
+    "Critical outage on the payments service, blocked on all orders",
+    "Minor UI bug: the footer overlaps on mobile",
+]
+
+
+# Functions -----------------------------------
+@app.function(
+    cpu=1,
+    memory=256,
+    secrets=[modal.Secret.from_name("openai-secret")],
 )
-
-
-# Tasks ---------------------------------------
-@env.task
 def classify_ticket(ticket: str) -> dict:
     """Use an LLM to classify a single support ticket."""
+    import json
+    import os
+
     from openai import OpenAI
 
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -59,12 +71,12 @@ def classify_ticket(ticket: str) -> dict:
     return result
 
 
-@env.task(report=True)
-async def build_report(scored: list[dict]) -> list[dict]:
+@app.function(cpu=1, memory=256)
+def build_report(scored: list[dict]) -> dict:
     """Rank tickets by priority and render a triage report."""
     ranked = sorted(scored, key=lambda t: t["priority"], reverse=True)
 
-    await flyte.report.replace.aio(build_html(ranked), do_flush=True)
+    html = build_html(ranked)
 
     # Also print for terminal visibility
     print("\n=== Ticket Priority Report ===\n")
@@ -72,27 +84,23 @@ async def build_report(scored: list[dict]) -> list[dict]:
         print(f"  {i}. [{t['priority']:.2f}] [{t.get('category','')}] {t['ticket']}")
         print(f"     → {t.get('suggested_action','')}\n")
 
-    return ranked
+    return {"ranked": ranked, "html": html}
 
 
-@env.task
-async def triage_pipeline(
-    tickets: list[str] = [
-        "URGENT: Production database is down, customers cannot log in",
-        "The export button gives an error when I click it",
-        "Love the new dashboard update, works great!",
-        "App has been slow and unresponsive for 2 days, very frustrated",
-        "Security breach detected — need immediate investigation",
-        "How do I reset my password?",
-        "Billing is wrong, I was charged twice. Want a refund",
-        "Great customer support, issue resolved quickly. Thanks!",
-        "Critical outage on the payments service, blocked on all orders",
-        "Minor UI bug: the footer overlaps on mobile",
-    ],
-) -> list[dict]:
+@app.local_entrypoint()
+def main():
     """Fan out LLM classification across all tickets, then build a report."""
-    # Fan out: classify every ticket in parallel on remote
-    scored = list(flyte.map(classify_ticket, tickets))
+    # Fan out: classify every ticket in parallel on Modal
+    scored = list(classify_ticket.map(TICKETS))
 
     # Aggregate: rank and report
-    return await build_report(scored)
+    result = build_report.remote(scored)
+
+    # Write the HTML report locally
+    out = "support_ticket_triage_report.html"
+    with open(out, "w") as f:
+        f.write(result["html"])
+    print(f"Wrote report to {out}")
+
+
+# uv run modal run workflow.py
