@@ -141,3 +141,29 @@ uv run flyte run --local --tui workflow.py research_pipeline --query "Compare qu
 ```bash
 uv run flyte start tui
 ```
+
+---
+
+### Running on Modal
+
+Several tutorials run on [Modal](https://modal.com) instead of a Flyte cluster. Their `requirements.txt` is just `modal` — all other dependencies are declared inline in each script's `modal.Image`, so there's no cluster to provision.
+
+- **Starter:** [DuckDB ETL](tutorials/starter-examples/duckdb-etl/), [LangGraph ReAct Agent](tutorials/starter-examples/langgraph-react-agent/), [Stable Diffusion](tutorials/starter-examples/stable-diffusion/), [Image Classifier](tutorials/starter-examples/image-classifier/)
+- **Fine-tuning:** [BERT Sentiment](tutorials/bert-fine-tuning-sentiment/), [BERT Emotion](tutorials/bert-fine-tuning-emotion/), [GRPO Math](tutorials/llm-fine-tuning-grpo-math/), [LoRA / QLoRA](tutorials/llm-fine-tuning-lora-qlora/)
+- **ML / serving:** [DETR Object Detection](tutorials/detr-object-detection/), [Gemma Chat (vLLM)](tutorials/gemma4-chat/), [Support Ticket Triage](tutorials/support-ticket-triage/)
+
+```bash
+# One-time auth (opens a browser)
+uv run modal setup
+
+# Run a job
+uv run modal run duckdb_etl.py
+
+# Serve an app — dev hot-reload, or a persistent deploy
+uv run modal serve app_gradio.py
+uv run modal deploy app_gradio.py
+```
+
+Some tutorials need a Modal secret (e.g. `openai-secret`, `huggingface-secret`) — each tutorial's README documents the exact `modal secret create` command.
+
+Don't have an account? Sign up at [modal.com](https://modal.com).
