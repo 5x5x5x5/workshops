@@ -1,4 +1,4 @@
-"""Flyte report helpers — CSS, SVG charts, attention heatmaps, and HTML wrappers."""
+"""Report helpers — CSS, SVG charts, attention heatmaps, and HTML wrappers."""
 
 import html as html_module
 

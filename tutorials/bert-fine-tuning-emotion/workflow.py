@@ -1,35 +1,44 @@
 """
-ModernBERT Emotion Classification — Fine-tune, evaluate, and explore.
+ModernBERT Emotion Classification — Fine-tune, evaluate, and explore on Modal.
 
 Fine-tune ModernBERT on emotion classification (6 classes: sadness, joy,
 love, anger, fear, surprise) from Twitter text. The pipeline trains the model,
 evaluates with confusion matrix and per-class metrics, then explores inference
 with attention heatmaps and token importance visualization.
 
+Each step builds a rich HTML report; because Modal has no live-report panel,
+the reports are returned from the pipeline and the local entrypoint writes them
+to disk as .html files you can open in a browser.
+
 Usage:
-    # Quick local test
-    flyte run --local --tui workflow.py pipeline \
-        --max_train_samples 200 --max_eval_samples 50 --epochs 1
+    # Quick local-scale test (small dataset, one epoch)
+    uv run modal run workflow.py --max-train-samples 200 --max-eval-samples 50 --epochs 1
 
     # Default (ModernBERT-base on emotion dataset)
-    flyte run workflow.py pipeline
+    uv run modal run workflow.py
 
-    # Remote with more data
-    flyte run workflow.py pipeline --epochs 3 --max_train_samples 10000
+    # More data
+    uv run modal run workflow.py --epochs 3 --max-train-samples 10000
 
     # Swap model
-    flyte run workflow.py pipeline --model_name "bert-base-uncased"
+    uv run modal run workflow.py --model-name "bert-base-uncased"
 """
 
+import io
 import json
 import logging
 import os
-import tempfile
+import tarfile
+from pathlib import Path
 
-import flyte
-import flyte.io
-import flyte.report
-from config import cpu_env, gpu_env, HF_TOKEN
+from config import (
+    DATA_PATH,
+    MODEL_PATH,
+    app,
+    data_volume,
+    hf_secret,
+    model_volume,
+)
 from report_helpers import (
     make_attention_text,
     make_bar_chart,
@@ -48,17 +57,26 @@ log.setLevel(logging.INFO)
 EMOTION_LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
 EMOTION_DATASET = "dair-ai/emotion"
 
+DATASET_DIR = f"{DATA_PATH}/dataset"
+FINETUNED_DIR = f"{MODEL_PATH}/finetuned_model"
+
 
 # ------------------------------------------------------------------
 # Task 1: Get data
 # ------------------------------------------------------------------
 
-@cpu_env.task(cache="auto")
+@app.function(
+    cpu=2,
+    memory=4096,
+    timeout=1800,
+    volumes={DATA_PATH: data_volume},
+    secrets=[hf_secret],
+)
 async def get_data(
     max_train_samples: int = 10000,
     max_eval_samples: int = 2000,
-) -> flyte.io.Dir:
-    """Download the emotion dataset and save train/eval splits.
+) -> str:
+    """Download the emotion dataset and save train/eval splits to the volume.
 
     The dair-ai/emotion dataset contains ~20k English Twitter messages labeled
     with one of 6 emotions: sadness, joy, love, anger, fear, surprise.
@@ -73,27 +91,37 @@ async def get_data(
 
     processed = DatasetDict({"train": train_ds, "eval": eval_ds})
 
-    output_dir = os.path.join(tempfile.mkdtemp(), "dataset")
-    processed.save_to_disk(output_dir)
+    processed.save_to_disk(DATASET_DIR)
+    data_volume.commit()
     log.info(f"Dataset ready: {len(train_ds)} train, {len(eval_ds)} eval")
 
-    return await flyte.io.Dir.from_local(output_dir)
+    return DATASET_DIR
 
 
 # ------------------------------------------------------------------
 # Task 2: Train
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="T4",
+    cpu=4,
+    memory=16384,
+    timeout=7200,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def train(
     model_name: str,
-    data_dir: flyte.io.Dir,
+    data_dir: str,
     epochs: int = 3,
     lr: float = 2e-5,
     batch_size: int = 16,
     warmup_steps: int = 100,
-) -> flyte.io.Dir:
-    """Fine-tune a BERT-style model for 6-class emotion classification."""
+) -> tuple[str, str]:
+    """Fine-tune a BERT-style model for 6-class emotion classification.
+
+    Returns (report_html, finetuned_model_dir).
+    """
     import numpy as np
     import torch
     from datasets import load_from_disk
@@ -106,26 +134,17 @@ async def train(
         TrainingArguments,
     )
 
+    hf_token = os.getenv("HF_TOKEN")
     log.info(f"Training: model={model_name}")
 
     id2label = {i: l for i, l in enumerate(EMOTION_LABELS)}
     label2id = {l: i for i, l in enumerate(EMOTION_LABELS)}
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Loading Model...</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="card"><p>Preparing for emotion classification training...</p></div>'
-        ),
-        do_flush=True,
-    )
-
     # -- Load data --
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    dataset = load_from_disk(data_dir)
 
     # -- Tokenize --
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     def tokenize(examples):
         return tokenizer(examples["text"], truncation=True, max_length=128, padding="max_length")
@@ -137,7 +156,7 @@ async def train(
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        token=HF_TOKEN,
+        token=hf_token,
         num_labels=6,
         id2label=id2label,
         label2id=label2id,
@@ -152,97 +171,11 @@ async def train(
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
         log.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
 
-    # -- Metrics tracking for live report --
+    # -- Metrics tracking for the report --
     training_log: list[dict] = []
     eval_log: list[dict] = []
 
-    def _build_training_report(max_steps: int) -> str:
-        stats_html = f"""
-        <h2>Training in Progress...</h2>
-        <h3>{model_name}</h3>
-        <div class="stat-grid">
-          <div class="stat"><div class="value">{len(dataset['train']):,}</div><div class="label">Train Samples</div></div>
-          <div class="stat"><div class="value">{len(dataset['eval']):,}</div><div class="label">Eval Samples</div></div>
-          <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>
-          <div class="stat"><div class="value">{lr}</div><div class="label">Learning Rate</div></div>
-          <div class="stat"><div class="value">{batch_size}</div><div class="label">Batch Size</div></div>
-          <div class="stat"><div class="value">{trainable_params:,}</div><div class="label">Parameters</div></div>
-        </div>
-        """
-
-        charts_html = ""
-
-        if training_log:
-            current = training_log[-1]
-            progress_pct = current["step"] / max_steps * 100 if max_steps else 0
-            loss_display = f"Loss: <span class=\"highlight\">{current['loss']:.4f}</span>" if current.get("loss") else ""
-            charts_html += f"""
-            <div class="card">
-              <b>Step {current['step']}/{max_steps}</b>
-              ({progress_pct:.0f}%) |
-              Epoch {current['epoch']:.2f}/{epochs}
-              {f' | {loss_display}' if loss_display else ''}
-              <div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">
-                <div style="background:#0f3460;width:{progress_pct:.1f}%;height:100%;border-radius:4px;"></div>
-              </div>
-            </div>
-            """
-
-            loss_entries = [e for e in training_log if "loss" in e]
-            if len(loss_entries) >= 2:
-                loss_chart = make_line_chart(
-                    data=loss_entries,
-                    x_key="epoch",
-                    y_keys=["loss"],
-                    title="Training Loss",
-                    x_label="Epoch",
-                    y_label="Loss",
-                    colors=["#5a7db5"],
-                )
-                charts_html += f'<div class="chart-container">{loss_chart}</div>'
-
-        if eval_log:
-            latest_eval = eval_log[-1]
-            best_acc = max(e.get("accuracy", 0) for e in eval_log)
-            best_f1 = max(e.get("f1", 0) for e in eval_log)
-            charts_html += f"""
-            <div class="stat-grid" style="margin-top:16px;">
-              <div class="stat"><div class="value">{latest_eval.get('accuracy', 0):.1%}</div><div class="label">Eval Accuracy</div></div>
-              <div class="stat"><div class="value">{latest_eval.get('f1', 0):.1%}</div><div class="label">Eval F1</div></div>
-              <div class="stat"><div class="value">{best_acc:.1%}</div><div class="label">Best Accuracy</div></div>
-              <div class="stat"><div class="value">{latest_eval.get('eval_loss', 0):.4f}</div><div class="label">Eval Loss</div></div>
-            </div>
-            """
-
-            if len(eval_log) >= 2:
-                eval_chart = make_line_chart(
-                    data=eval_log,
-                    x_key="epoch",
-                    y_keys=["accuracy", "f1"],
-                    title="Eval Metrics Over Training",
-                    x_label="Epoch",
-                    y_label="Score",
-                    colors=["#0f3460", "#06d6a0"],
-                    y_max_cap=1.05,
-                    y_display_names={"accuracy": "Accuracy", "f1": "Weighted F1"},
-                )
-                charts_html += f'<div class="chart-container">{eval_chart}</div>'
-
-                eval_loss_chart = make_line_chart(
-                    data=[e for e in eval_log if "eval_loss" in e],
-                    x_key="epoch",
-                    y_keys=["eval_loss"],
-                    title="Eval Loss",
-                    x_label="Epoch",
-                    y_label="Loss",
-                    colors=["#e63946"],
-                )
-                if any("eval_loss" in e for e in eval_log):
-                    charts_html += f'<div class="chart-container">{eval_loss_chart}</div>'
-
-        return wrap_report(stats_html + charts_html)
-
-    # -- Callbacks --
+    # -- Callback: collect loss/eval metrics for the charts --
     class ReportCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kwargs):
             if not logs:
@@ -263,11 +196,6 @@ async def train(
             if "loss" in entry:
                 training_log.append(entry)
 
-            flyte.report.replace(
-                _build_training_report(state.max_steps),
-                do_flush=True,
-            )
-
     # -- Compute metrics --
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
@@ -278,7 +206,7 @@ async def train(
         }
 
     # -- Training --
-    output_dir = os.path.join(tempfile.mkdtemp(), "checkpoints")
+    output_dir = "/tmp/checkpoints"
     training_args = TrainingArguments(
         output_dir=output_dir,
         num_train_epochs=epochs,
@@ -307,19 +235,14 @@ async def train(
     )
 
     log.info("Starting training...")
-    await flyte.report.replace.aio(
-        _build_training_report(0),
-        do_flush=True,
-    )
-
     trainer.train()
     log.info("Training complete.")
 
-    # -- Save model --
-    save_dir = os.path.join(tempfile.mkdtemp(), "finetuned_model")
-    trainer.save_model(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    log.info(f"Model saved to {save_dir}")
+    # -- Save model to the shared volume --
+    trainer.save_model(FINETUNED_DIR)
+    tokenizer.save_pretrained(FINETUNED_DIR)
+    model_volume.commit()
+    log.info(f"Model saved to {FINETUNED_DIR}")
 
     # -- Final eval + report --
     metrics = trainer.evaluate()
@@ -354,40 +277,44 @@ async def train(
         )
         final_charts += f'<div class="chart-container">{eval_chart}</div>'
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Training Complete</h2>"
-            f"<h3>{model_name}</h3>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{final_acc:.1%}</div><div class="label">Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{final_f1:.1%}</div><div class="label">Weighted F1</div></div>'
-            f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
-            f'  <div class="stat"><div class="value">{trainable_params:,}</div><div class="label">Parameters</div></div>'
-            f'</div>'
-            f"{final_charts}"
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>Training Complete</h2>"
+        f"<h3>{model_name}</h3>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{final_acc:.1%}</div><div class="label">Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{final_f1:.1%}</div><div class="label">Weighted F1</div></div>'
+        f'  <div class="stat"><div class="value">{epochs}</div><div class="label">Epochs</div></div>'
+        f'  <div class="stat"><div class="value">{trainable_params:,}</div><div class="label">Parameters</div></div>'
+        f'</div>'
+        f"{final_charts}"
     )
 
-    return await flyte.io.Dir.from_local(save_dir)
+    return report_html, FINETUNED_DIR
 
 
 # ------------------------------------------------------------------
 # Task 3: Evaluate
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="T4",
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def evaluate(
     model_name: str,
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
+    finetuned_dir: str,
+    data_dir: str,
     num_examples: int = 200,
-) -> str:
+) -> tuple[str, str]:
     """Compare base model (random head) vs fine-tuned on emotion classification.
 
     Produces confusion matrix, per-class precision/recall/F1, and overall metrics.
+    Returns (metrics_json, report_html).
     """
-    import numpy as np
     import torch
     from datasets import load_from_disk
     from sklearn.metrics import (
@@ -398,15 +325,11 @@ async def evaluate(
     )
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+    hf_token = os.getenv("HF_TOKEN")
     log.info("Starting evaluation...")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Loading models...</p>"),
-        do_flush=True,
-    )
 
     # -- Load eval data --
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    dataset = load_from_disk(data_dir)
     eval_ds = dataset["eval"].select(range(min(num_examples, len(dataset["eval"]))))
     texts = eval_ds["text"]
     labels = eval_ds["label"]
@@ -428,14 +351,9 @@ async def evaluate(
 
     # -- Base model --
     log.info(f"Loading base model: {model_name}")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Running base model (random classifier head)...</p>"),
-        do_flush=True,
-    )
-
-    base_tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+    base_tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, token=HF_TOKEN, num_labels=6,
+        model_name, token=hf_token, num_labels=6,
     )
     base_model.eval()
     if torch.cuda.is_available():
@@ -448,14 +366,8 @@ async def evaluate(
 
     # -- Fine-tuned model --
     log.info("Loading fine-tuned model...")
-    await flyte.report.replace.aio(
-        wrap_report("<h2>Evaluation</h2><p>Running fine-tuned model...</p>"),
-        do_flush=True,
-    )
-
-    ft_path = await finetuned_dir.download()
-    ft_tokenizer = AutoTokenizer.from_pretrained(ft_path)
-    ft_model = AutoModelForSequenceClassification.from_pretrained(ft_path)
+    ft_tokenizer = AutoTokenizer.from_pretrained(finetuned_dir)
+    ft_model = AutoModelForSequenceClassification.from_pretrained(finetuned_dir)
     ft_model.eval()
     if torch.cuda.is_available():
         ft_model = ft_model.cuda()
@@ -540,26 +452,23 @@ async def evaluate(
   Fine-tuned: <span class="badge {ft_badge}">{ft_label}</span></p>
 </div>"""
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Evaluation Results — Emotion Classification</h2>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{base_acc:.1f}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{ft_acc:.1f}%</div><div class="label">Fine-tuned Accuracy</div></div>'
-            f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
-            f'  <div class="stat"><div class="value">{ft_f1:.1f}%</div><div class="label">Fine-tuned F1</div></div>'
-            f'</div>'
-            f'<div class="chart-container">{bar_chart}</div>'
-            f'<div class="chart-container">{cm_svg}</div>'
-            f"<h3>Per-Class Metrics (Fine-tuned)</h3>"
-            f"{per_class_html}"
-            f"<h3>Example Predictions</h3>"
-            f"{examples_html}"
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>Evaluation Results — Emotion Classification</h2>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{base_acc:.1f}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{ft_acc:.1f}%</div><div class="label">Fine-tuned Accuracy</div></div>'
+        f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
+        f'  <div class="stat"><div class="value">{ft_f1:.1f}%</div><div class="label">Fine-tuned F1</div></div>'
+        f'</div>'
+        f'<div class="chart-container">{bar_chart}</div>'
+        f'<div class="chart-container">{cm_svg}</div>'
+        f"<h3>Per-Class Metrics (Fine-tuned)</h3>"
+        f"{per_class_html}"
+        f"<h3>Example Predictions</h3>"
+        f"{examples_html}"
     )
 
-    return json.dumps({
+    metrics_json = json.dumps({
         "base_accuracy": round(base_acc, 1),
         "base_f1": round(base_f1, 1),
         "finetuned_accuracy": round(ft_acc, 1),
@@ -570,17 +479,26 @@ async def evaluate(
         "per_class": {k: report_dict[k] for k in EMOTION_LABELS if k in report_dict},
     })
 
+    return metrics_json, report_html
+
 
 # ------------------------------------------------------------------
 # Task 4: Explore inference
 # ------------------------------------------------------------------
 
-@gpu_env.task(report=True)
+@app.function(
+    gpu="T4",
+    cpu=4,
+    memory=16384,
+    timeout=3600,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
 async def explore_inference(
-    finetuned_dir: flyte.io.Dir,
-    data_dir: flyte.io.Dir,
+    finetuned_dir: str,
+    data_dir: str,
     num_examples: int = 8,
-) -> str:
+) -> tuple[str, str]:
     """Deep-dive into model behavior with attention and token importance.
 
     For a set of examples, this task produces:
@@ -590,28 +508,21 @@ async def explore_inference(
     3. Token importance via gradient-based attribution — which tokens most
        influence the predicted class (gradient x embedding norm)
     4. Misclassification analysis — confident wrong predictions with explanations
+
+    Returns (analysis_json, report_html).
     """
-    import numpy as np
     import torch
     from datasets import load_from_disk
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
     log.info("Starting explore_inference...")
-    await flyte.report.replace.aio(
-        wrap_report(
-            "<h2>Explore Inference</h2>"
-            "<p>Loading model for attention and attribution analysis...</p>"
-        ),
-        do_flush=True,
-    )
 
     # -- Load model (with eager attention for weight extraction) --
-    ft_path = await finetuned_dir.download()
-    tokenizer = AutoTokenizer.from_pretrained(ft_path)
+    tokenizer = AutoTokenizer.from_pretrained(finetuned_dir)
 
     # Need eager attention to extract attention weights (flash attention doesn't return them)
     model = AutoModelForSequenceClassification.from_pretrained(
-        ft_path,
+        finetuned_dir,
         output_attentions=True,
         attn_implementation="eager",
     )
@@ -620,8 +531,7 @@ async def explore_inference(
     model = model.to(device)
 
     # -- Load eval data --
-    data_path = await data_dir.download()
-    dataset = load_from_disk(data_path)
+    dataset = load_from_disk(data_dir)
     eval_ds = dataset["eval"]
 
     # Pick a diverse set of examples — try to get some from each class
@@ -642,17 +552,6 @@ async def explore_inference(
     for idx_num, ds_idx in enumerate(selected_indices):
         text = eval_ds[ds_idx]["text"]
         true_label = eval_ds[ds_idx]["label"]
-
-        await flyte.report.replace.aio(
-            wrap_report(
-                f"<h2>Explore Inference</h2>"
-                f"<p>Analyzing example {idx_num + 1}/{len(selected_indices)}...</p>"
-                f'<div style="background:#e9ecef;border-radius:4px;height:8px;margin-top:8px;">'
-                f'<div style="background:#0f3460;width:{(idx_num + 1) / len(selected_indices) * 100:.1f}%;height:100%;border-radius:4px;"></div>'
-                f'</div>'
-            ),
-            do_flush=True,
-        )
 
         # Tokenize
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
@@ -754,7 +653,6 @@ async def explore_inference(
     total = len(analyses)
 
     # Separate correct vs wrong
-    correct_analyses = [a for a in analyses if a["correct"]]
     wrong_analyses = [a for a in analyses if not a["correct"]]
 
     # -- Build example cards --
@@ -824,29 +722,26 @@ async def explore_inference(
   </p>
 </div>"""
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Explore Inference — Attention &amp; Attribution</h2>"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{correct}/{total}</div><div class="label">Correct</div></div>'
-            f'  <div class="stat"><div class="value">{correct/total:.0%}</div><div class="label">Accuracy (sample)</div></div>'
-            f'  <div class="stat"><div class="value">{len(wrong_analyses)}</div><div class="label">Errors to Analyze</div></div>'
-            f'</div>'
-            f'<div class="note">'
-            f'<b>How to read the visualizations below:</b><br/>'
-            f'<b>Attention heatmap:</b> Shows which tokens the [CLS] token attends to in the final layer '
-            f'(averaged across all attention heads). Darker = more attention. This reveals what the model "looks at" when making its classification decision.<br/>'
-            f'<b>Token importance:</b> Gradient-based attribution showing which tokens most influence the prediction. '
-            f'Green = supports the prediction, Red = opposes it. Computed as gradient &times; embedding norm.'
-            f'</div>'
-            f"<h3>Example Analysis</h3>"
-            f"{examples_html}"
-            f"{misclass_html}"
-        ),
-        do_flush=True,
+    report_html = wrap_report(
+        f"<h2>Explore Inference — Attention &amp; Attribution</h2>"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{correct}/{total}</div><div class="label">Correct</div></div>'
+        f'  <div class="stat"><div class="value">{correct/total:.0%}</div><div class="label">Accuracy (sample)</div></div>'
+        f'  <div class="stat"><div class="value">{len(wrong_analyses)}</div><div class="label">Errors to Analyze</div></div>'
+        f'</div>'
+        f'<div class="note">'
+        f'<b>How to read the visualizations below:</b><br/>'
+        f'<b>Attention heatmap:</b> Shows which tokens the [CLS] token attends to in the final layer '
+        f'(averaged across all attention heads). Darker = more attention. This reveals what the model "looks at" when making its classification decision.<br/>'
+        f'<b>Token importance:</b> Gradient-based attribution showing which tokens most influence the prediction. '
+        f'Green = supports the prediction, Red = opposes it. Computed as gradient &times; embedding norm.'
+        f'</div>'
+        f"<h3>Example Analysis</h3>"
+        f"{examples_html}"
+        f"{misclass_html}"
     )
 
-    return json.dumps({
+    analysis_json = json.dumps({
         "num_examples": total,
         "correct": correct,
         "accuracy": round(correct / total * 100, 1),
@@ -863,13 +758,21 @@ async def explore_inference(
         ],
     })
 
+    return analysis_json, report_html
+
 
 # ------------------------------------------------------------------
 # Pipeline
 # ------------------------------------------------------------------
 
-@cpu_env.task(report=True)
-async def pipeline(
+@app.function(
+    cpu=2,
+    memory=4096,
+    timeout=10800,
+    volumes={DATA_PATH: data_volume, MODEL_PATH: model_volume},
+    secrets=[hf_secret],
+)
+def pipeline(
     model_name: str = "answerdotai/ModernBERT-base",
     epochs: int = 3,
     lr: float = 2e-5,
@@ -879,95 +782,127 @@ async def pipeline(
     max_eval_samples: int = 2000,
     num_eval_examples: int = 200,
     num_explore_examples: int = 12,
-) -> flyte.io.Dir:
+) -> dict:
     """
     ModernBERT emotion classification pipeline.
 
-    Returns the fine-tuned model directory (used by serve.py for deployment).
+    Returns a dict with the rendered HTML reports, the eval metrics, and a
+    gzipped tarball of the fine-tuned model (also persisted to the model volume
+    for serve.py). The local entrypoint writes these to disk.
 
     1. Download emotion dataset (6 classes from Twitter text)
     2. Fine-tune ModernBERT for sequence classification
     3. Evaluate: base vs fine-tuned with confusion matrix
     4. Explore inference: attention heatmaps + token importance
-
-    Args:
-        model_name: HuggingFace encoder model to fine-tune.
-        num_explore_examples: Number of examples for attention/attribution analysis.
     """
     log.info(f"Pipeline: {model_name} | emotion classification")
     steps = ["Get Data", "Train", "Evaluate", "Explore Inference"]
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Emotion Classification Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(0, steps)}"
-            f'<div class="card"><p>Downloading emotion dataset...</p></div>'
-        ),
-        do_flush=True,
-    )
-
     # Step 1: Get data
-    data_dir = await get_data(max_train_samples, max_eval_samples)
+    data_dir = get_data.remote(max_train_samples, max_eval_samples)
 
     # Step 2: Train
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Emotion Classification Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(1, steps)}"
-            f'<div class="card"><p>Fine-tuning for emotion classification...</p></div>'
-        ),
-        do_flush=True,
+    train_html, finetuned_dir = train.remote(
+        model_name, data_dir, epochs, lr, batch_size, warmup_steps
     )
-
-    finetuned_dir = await train(model_name, data_dir, epochs, lr, batch_size, warmup_steps)
 
     # Step 3: Evaluate
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Emotion Classification Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(2, steps)}"
-            f'<div class="card"><p>Evaluating base vs fine-tuned model...</p></div>'
-        ),
-        do_flush=True,
+    eval_result, eval_html = evaluate.remote(
+        model_name, finetuned_dir, data_dir, num_eval_examples
     )
-
-    eval_result = await evaluate(model_name, finetuned_dir, data_dir, num_eval_examples)
     eval_metrics = json.loads(eval_result)
 
     # Step 4: Explore inference
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Emotion Classification Pipeline</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(3, steps)}"
-            f'<div class="card"><p>Analyzing attention patterns and token importance...</p></div>'
-        ),
-        do_flush=True,
+    explore_result, explore_html = explore_inference.remote(
+        finetuned_dir, data_dir, num_explore_examples
     )
 
-    explore_result = await explore_inference(finetuned_dir, data_dir, num_explore_examples)
-
-    # -- Final report --
+    # -- Final pipeline summary report --
     improvement = eval_metrics["improvement"]
     imp_badge = "badge-success" if improvement > 0 else "badge-danger" if improvement < 0 else "badge-info"
 
-    await flyte.report.replace.aio(
-        wrap_report(
-            f"<h2>Emotion Classification Pipeline Complete</h2>"
-            f"<h3>{model_name}</h3>"
-            f"{pipeline_step_indicator(4, steps)}"
-            f'<div class="stat-grid">'
-            f'  <div class="stat"><div class="value">{eval_metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
-            f'  <div class="stat"><div class="value">{eval_metrics["finetuned_accuracy"]}%</div><div class="label">Fine-tuned Accuracy</div></div>'
-            f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
-            f'  <div class="stat"><div class="value">{eval_metrics["finetuned_f1"]}%</div><div class="label">Weighted F1</div></div>'
-            f'</div>'
-        ),
-        do_flush=True,
+    pipeline_html = wrap_report(
+        f"<h2>Emotion Classification Pipeline Complete</h2>"
+        f"<h3>{model_name}</h3>"
+        f"{pipeline_step_indicator(4, steps)}"
+        f'<div class="stat-grid">'
+        f'  <div class="stat"><div class="value">{eval_metrics["base_accuracy"]}%</div><div class="label">Base Accuracy</div></div>'
+        f'  <div class="stat"><div class="value">{eval_metrics["finetuned_accuracy"]}%</div><div class="label">Fine-tuned Accuracy</div></div>'
+        f'  <div class="stat"><div class="value"><span class="badge {imp_badge}">{improvement:+.1f}pp</span></div><div class="label">Improvement</div></div>'
+        f'  <div class="stat"><div class="value">{eval_metrics["finetuned_f1"]}%</div><div class="label">Weighted F1</div></div>'
+        f'</div>'
     )
 
+    # -- Tar the fine-tuned model so the entrypoint can save it locally --
+    model_volume.reload()
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(finetuned_dir, arcname="finetuned_model")
+    model_tar = buf.getvalue()
+
     log.info(f"Pipeline complete. Accuracy improvement: {improvement:+.1f}pp")
-    return finetuned_dir
+
+    return {
+        "reports": {
+            "pipeline": pipeline_html,
+            "train": train_html,
+            "evaluate": eval_html,
+            "explore": explore_html,
+        },
+        "metrics": eval_metrics,
+        "explore": json.loads(explore_result),
+        "model_tar": model_tar,
+        "model_dir": finetuned_dir,
+    }
+
+
+# ------------------------------------------------------------------
+# Local entrypoint
+# ------------------------------------------------------------------
+
+@app.local_entrypoint()
+def main(
+    model_name: str = "answerdotai/ModernBERT-base",
+    epochs: int = 3,
+    lr: float = 2e-5,
+    batch_size: int = 16,
+    warmup_steps: int = 100,
+    max_train_samples: int = 10000,
+    max_eval_samples: int = 2000,
+    num_eval_examples: int = 200,
+    num_explore_examples: int = 12,
+):
+    """Run the pipeline in the cloud and write reports + model locally."""
+    result = pipeline.remote(
+        model_name,
+        epochs,
+        lr,
+        batch_size,
+        warmup_steps,
+        max_train_samples,
+        max_eval_samples,
+        num_eval_examples,
+        num_explore_examples,
+    )
+
+    out_dir = Path("outputs")
+    out_dir.mkdir(exist_ok=True)
+
+    # Write the HTML reports (Modal has no live-report panel).
+    for name, html in result["reports"].items():
+        path = out_dir / f"{name}_report.html"
+        path.write_text(html, encoding="utf-8")
+        print(f"Wrote {path}")
+
+    # Extract the fine-tuned model locally (also lives in the model volume).
+    model_tar = result["model_tar"]
+    with tarfile.open(fileobj=io.BytesIO(model_tar), mode="r:gz") as tar:
+        tar.extractall(out_dir)
+    print(f"Wrote {out_dir / 'finetuned_model'} ({len(model_tar):,} bytes tarball)")
+
+    metrics = result["metrics"]
+    print(
+        f"Done. Base {metrics['base_accuracy']}% -> "
+        f"Fine-tuned {metrics['finetuned_accuracy']}% "
+        f"({metrics['improvement']:+.1f}pp), F1 {metrics['finetuned_f1']}%"
+    )

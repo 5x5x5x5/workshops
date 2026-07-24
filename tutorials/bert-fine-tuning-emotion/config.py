@@ -1,27 +1,34 @@
-import os
-from dotenv import load_dotenv
-import flyte
+"""Shared Modal image, app, secret, and volumes for the emotion pipeline."""
 
-load_dotenv()
+import modal
 
-base_image = flyte.Image.from_debian_base(
-    name="bert-emotion",
-).with_requirements("requirements.txt")
-
-gpu_env = flyte.TaskEnvironment(
-    name="bert-emotion-gpu",
-    image=base_image,
-    resources=flyte.Resources(cpu=4, memory="16Gi", gpu="T4:1"),
-    secrets=[
-        # flyte.Secret(key="HF_TOKEN", as_env_var="HF_TOKEN"),
-    ],
+# Container image with all pipeline dependencies. Torch is installed from the
+# CUDA 12.4 wheel index so training runs on the GPU.
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch>=2.1.0",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install(
+        "transformers>=4.45.0",
+        "datasets>=3.0.0",
+        "accelerate>=0.34.0",
+        "scikit-learn",
+        "numpy",
+    )
 )
 
-cpu_env = flyte.TaskEnvironment(
-    name="bert-emotion-cpu",
-    image=base_image,
-    resources=flyte.Resources(cpu=2, memory="4Gi"),
-    depends_on=[gpu_env],
-)
+app = modal.App("bert-emotion", image=image)
 
-HF_TOKEN = os.getenv("HF_TOKEN")
+# HuggingFace token (needed only for gated models). Create it once with:
+#   modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
+# The secret injects HF_TOKEN into the container environment at run time.
+hf_secret = modal.Secret.from_name("huggingface-secret")
+
+# Shared volumes bridge the pipeline steps: `get_data` writes the dataset,
+# `train` writes the fine-tuned model, and evaluate/explore/serve read them back.
+data_volume = modal.Volume.from_name("bert-emotion-data", create_if_missing=True)
+model_volume = modal.Volume.from_name("bert-emotion-model", create_if_missing=True)
+DATA_PATH = "/data"
+MODEL_PATH = "/models"

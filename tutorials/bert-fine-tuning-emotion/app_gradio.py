@@ -1,59 +1,43 @@
 """
-Emotion Classifier — Gradio frontend.
+Emotion Classifier — Gradio frontend on Modal.
 
-Type text and see emotion predictions with confidence scores and
-an attention heatmap showing which words the model focuses on.
+Type text and see emotion predictions with confidence scores and an attention
+heatmap showing which words the model focuses on. The UI loads the fine-tuned
+model (produced by workflow.py) from the shared model volume and runs inference
+in-process, so it works on its own after training. serve.py is the standalone
+REST API if you prefer the Gradio-as-thin-HTTP-client split.
 
 Usage:
-    # Deploy to cluster (auto-discovers the serve.py endpoint)
-    python app_gradio.py
+    # Dev server with hot-reload (ephemeral URL)
+    uv run modal serve app_gradio.py
 
-    # Local test (requires serve.py running)
-    SERVER_URL=https://your-app-url python app_gradio.py
+    # Persistent deployment
+    uv run modal deploy app_gradio.py
 """
 
-import logging
-import os
-import pathlib
+import modal
 
-import flyte
-import flyte.app
-
-logging.basicConfig(level=logging.INFO, format="%(message)s")
-log = logging.getLogger(__name__)
-
-# ------------------------------------------------------------------
-# Image & environment
-# ------------------------------------------------------------------
-
-app_image = flyte.Image.from_debian_base(
-    name="emotion-classifier-gradio",
-).with_pip_packages(
-    "flyte[tui]>=2.0",
-    "gradio>=5.0.0",
-    "httpx",
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "torch",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
+    )
+    .pip_install(
+        "transformers",
+        "accelerate",
+        "gradio>=5.0.0",
+        "fastapi[standard]",
+    )
 )
 
-SERVER_APP_NAME = "emotion-classifier-api"
+app = modal.App("emotion-classifier-ui", image=image)
 
-gradio_env = flyte.app.AppEnvironment(
-    name="emotion-classifier-ui",
-    image=app_image,
-    resources=flyte.Resources(cpu=1, memory="2Gi"),
-    requires_auth=False,
-    port=7860,
-    parameters=[
-        flyte.app.Parameter(
-            name="server_url",
-            value="",
-            env_var="SERVER_URL",
-        ),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=1800,
-    ),
-)
+# The fine-tuned model is written to this volume by workflow.py.
+model_volume = modal.Volume.from_name("bert-emotion-model", create_if_missing=True)
+MODEL_PATH = "/models"
+FINETUNED_DIR = f"{MODEL_PATH}/finetuned_model"
+EMOTION_LABELS = ["sadness", "joy", "love", "anger", "fear", "surprise"]
 
 
 # ------------------------------------------------------------------
@@ -96,28 +80,94 @@ EMOTION_EMOJI = {
 # Gradio app
 # ------------------------------------------------------------------
 
-@gradio_env.server
-def launch_app(server_url: str):
-    import gradio as gr
-    import httpx
+@app.function(gpu="T4", memory=8192, volumes={MODEL_PATH: model_volume})
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    from pathlib import Path
 
-    api_url = server_url.rstrip("/")
-    log.info(f"Connecting to emotion classifier: {api_url}")
+    import gradio as gr
+    import torch
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    # -- Load the fine-tuned model once per container --
+    model_path = Path(FINETUNED_DIR)
+    model = None
+    tokenizer = None
+    if model_path.exists():
+        tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+        model = AutoModelForSequenceClassification.from_pretrained(
+            str(model_path),
+            output_attentions=True,
+            attn_implementation="eager",
+        )
+        model.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device)
+
+    def run_inference(text: str):
+        """Run the model and return the same shape serve.py's /predict returns."""
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        probs = torch.softmax(outputs.logits[0], dim=-1).cpu().tolist()
+        pred_idx = int(torch.argmax(outputs.logits[0]).item())
+
+        last_attention = outputs.attentions[-1][0]
+        cls_attention = last_attention.mean(dim=0)[0].cpu().tolist()
+
+        token_ids = inputs["input_ids"][0]
+        raw_tokens = tokenizer.convert_ids_to_tokens(token_ids)
+
+        clean_tokens = []
+        clean_attention = []
+        for i, tok in enumerate(raw_tokens):
+            if tok in ("[CLS]", "[SEP]", "<s>", "</s>", "[PAD]", "<pad>"):
+                continue
+            if tok == tokenizer.pad_token:
+                continue
+            display_tok = tok.replace("##", "").replace("Ġ", "").replace("▁", "")
+            if not display_tok.strip():
+                continue
+            clean_tokens.append(display_tok)
+            clean_attention.append(cls_attention[i])
+
+        if clean_attention:
+            max_att = max(clean_attention)
+            min_att = min(clean_attention)
+            att_range = max_att - min_att or 1
+            clean_attention = [(a - min_att) / att_range for a in clean_attention]
+
+        return {
+            "predicted_emotion": EMOTION_LABELS[pred_idx],
+            "confidence": round(probs[pred_idx], 4),
+            "scores": [
+                {"label": EMOTION_LABELS[i], "score": round(probs[i], 4)}
+                for i in range(len(EMOTION_LABELS))
+            ],
+            "tokens": clean_tokens,
+            "attention_weights": clean_attention,
+        }
 
     def predict(text: str):
         if not text.strip():
             return "", "", ""
 
-        try:
-            response = httpx.post(
-                f"{api_url}/predict",
-                json={"text": text},
-                timeout=30.0,
+        if model is None:
+            return (
+                "Model not found in the volume. Run the pipeline first: "
+                "`uv run modal run workflow.py`",
+                "",
+                "",
             )
-            response.raise_for_status()
-            result = response.json()
-        except httpx.ConnectError:
-            return "Could not connect to the model server. Is it running?", "", ""
+
+        try:
+            result = run_inference(text)
         except Exception as e:
             return f"Error: {e}", "", ""
 
@@ -125,7 +175,6 @@ def launch_app(server_url: str):
         emotion = result["predicted_emotion"]
         confidence = result["confidence"]
         emoji = EMOTION_EMOJI.get(emotion, "")
-        color = EMOTION_COLORS.get(emotion, "#333")
 
         summary = f"## {emoji} {emotion.title()} ({confidence:.1%})\n\n"
 
@@ -189,6 +238,7 @@ def launch_app(server_url: str):
     # Build the Gradio UI
     with gr.Blocks(
         title="Emotion Classifier",
+        theme=gr.themes.Soft(),
         css="""
         .main-header { text-align: center; margin-bottom: 20px; }
         .emotion-card { border-radius: 12px; padding: 20px; }
@@ -237,43 +287,4 @@ def launch_app(server_url: str):
             outputs=[prediction_output, attention_output, error_output],
         )
 
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=os.environ.get("GRADIO_SHARE", "") == "1",
-        theme=gr.themes.Soft(),
-    )
-
-
-# ------------------------------------------------------------------
-# Deploy / local dev
-# ------------------------------------------------------------------
-
-if __name__ == "__main__":
-    server_url = os.environ.get("SERVER_URL", "")
-
-    if server_url:
-        launch_app(server_url)
-    else:
-        flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-
-        from flyte.remote._app import App
-
-        try:
-            server_app = App.get(SERVER_APP_NAME)
-            server_endpoint = server_app.endpoint
-            log.info(f"Found emotion classifier at: {server_endpoint}")
-        except Exception:
-            raise RuntimeError(
-                f"Could not find deployed app '{SERVER_APP_NAME}'. "
-                "Deploy the model server first with: python serve.py"
-            )
-
-        for p in gradio_env.parameters:
-            if p.name == "server_url":
-                p.value = server_endpoint
-                break
-
-        log.info("Deploying Gradio frontend...")
-        deployed = flyte.deploy(gradio_env)
-        log.info(f"Gradio app deployed: {deployed}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")

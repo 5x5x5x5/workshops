@@ -1,6 +1,6 @@
 # ModernBERT Emotion Classification
 
-Fine-tune ModernBERT to classify emotions in text, then explore *how* the model makes decisions with attention heatmaps and gradient-based token attribution.
+Fine-tune ModernBERT to classify emotions in text, then explore *how* the model makes decisions with attention heatmaps and gradient-based token attribution — running on GPUs with [Modal](https://modal.com).
 
 <a target="_blank" href="https://colab.research.google.com/github/unionai/workshops/blob/main/tutorials/bert-fine-tuning-emotion/bert-emotion-tutorial.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
@@ -24,13 +24,13 @@ The dataset is [dair-ai/emotion](https://huggingface.co/datasets/dair-ai/emotion
 └──────────┘    └────────────┘    └────────────┘    │    (GPU)        │
  emotion         ModernBERT        Confusion         └─────────────────┘
  dataset         fine-tuning       matrix +           Attention heatmaps
-                 with live         per-class           + token importance
-                 loss/eval         metrics             + misclassification
-                 charts                                analysis
+                 with loss/eval    per-class           + token importance
+                 charts            metrics             + misclassification
+                                                       analysis
 ```
 
 1. **Get data** — Downloads the emotion dataset, shuffles, and splits into train/eval.
-2. **Train** — Fine-tunes ModernBERT (or any HuggingFace encoder) for 6-class classification. Live report shows loss curve, eval accuracy/F1, and a progress bar.
+2. **Train** — Fine-tunes ModernBERT (or any HuggingFace encoder) for 6-class classification. The report shows loss curve, eval accuracy/F1, and final metrics.
 3. **Evaluate** — Compares the base model (random classifier head) vs fine-tuned. Produces a confusion matrix heatmap, per-class precision/recall/F1, and a grouped bar chart of per-class accuracy.
 4. **Explore inference** — The interesting part. For a set of examples, produces:
    - **Confidence distribution** — Softmax probabilities across all 6 emotions, not just the argmax
@@ -38,16 +38,20 @@ The dataset is [dair-ai/emotion](https://huggingface.co/datasets/dair-ai/emotion
    - **Token importance** — Gradient-based attribution (gradient x embedding norm) showing which tokens most influence the prediction. Green = supports prediction, red = opposes
    - **Misclassification spotlight** — The model's most confident wrong predictions, revealing blind spots
 
+Each step builds a rich HTML report. Modal has no live-report panel, so the reports are returned from the pipeline and the local entrypoint writes them to `outputs/*.html` — open them in a browser after the run.
+
 ## Files
 
 | File | What it does |
 |------|-------------|
-| `workflow.py` | Full pipeline — get_data, train, evaluate, explore_inference |
-| `config.py` | Flyte task environments (CPU/GPU), image config, secrets |
+| `workflow.py` | Full pipeline — get_data, train, evaluate, explore_inference, and the `local_entrypoint` |
+| `config.py` | Shared Modal image, app, HF secret, and volumes |
 | `report_helpers.py` | SVG charts, confusion matrix, attention/importance visualization |
-| `serve.py` | FastAPI model server — serves predictions with attention weights |
-| `app_gradio.py` | Gradio frontend — interactive UI with attention heatmap |
-| `requirements.txt` | Python dependencies |
+| `serve.py` | FastAPI model server on Modal — serves predictions with attention weights |
+| `app_gradio.py` | Gradio frontend on Modal — interactive UI with attention heatmap |
+| `requirements.txt` | Local dependency (just `modal`) |
+
+All the heavy dependencies (torch, transformers, datasets, ...) are declared inline in the `modal.Image`, so the only thing you install locally is `modal`.
 
 ## Setup
 
@@ -58,124 +62,140 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-Set your HuggingFace token (needed for gated models):
+## Modal account (one-time)
 
 ```bash
-echo "HF_TOKEN=hf_your_token_here" > .env
+uv run modal setup
 ```
+
+This opens a browser to authenticate. Don't have an account? Sign up at [modal.com](https://modal.com).
+
+### HuggingFace token (optional)
+
+ModernBERT doesn't require a token, but if you swap to a gated model you'll need one. Store it as a Modal secret named `huggingface-secret` (it's injected as `HF_TOKEN` into the containers):
+
+```bash
+modal secret create huggingface-secret HF_TOKEN=hf_your_token_here
+```
+
+The pipeline functions attach this secret. If you only use ungated models like ModernBERT, still create the secret (an empty/placeholder value is fine) so the functions can start.
 
 ## Run
 
-### Quick local test
+### Quick test
 
 ```bash
-flyte run --local --tui workflow.py pipeline \
-  --max_train_samples 200 \
-  --max_eval_samples 50 \
+uv run modal run workflow.py \
+  --max-train-samples 200 \
+  --max-eval-samples 50 \
   --epochs 1 \
-  --num_eval_examples 30 \
-  --num_explore_examples 6
+  --num-eval-examples 30 \
+  --num-explore-examples 6
 ```
 
-Small dataset, one epoch — finishes in a few minutes on CPU. Good for verifying the pipeline works.
+Small dataset, one epoch — finishes quickly. Good for verifying the pipeline works end to end.
 
 ### Standard run
 
 ```bash
-flyte run workflow.py pipeline \
-  --model_name "answerdotai/ModernBERT-base" \
+uv run modal run workflow.py \
+  --model-name "answerdotai/ModernBERT-base" \
   --epochs 3 \
   --lr 2e-5 \
-  --batch_size 16 \
-  --max_train_samples 10000 \
-  --max_eval_samples 2000 \
-  --num_eval_examples 200 \
-  --num_explore_examples 12
+  --batch-size 16 \
+  --max-train-samples 10000 \
+  --max-eval-samples 2000 \
+  --num-eval-examples 200 \
+  --num-explore-examples 12
 ```
 
 ### With classic BERT
 
 ```bash
-flyte run workflow.py pipeline --model_name "bert-base-uncased"
+uv run modal run workflow.py --model-name "bert-base-uncased"
 ```
 
 ### Longer training
 
 ```bash
-flyte run workflow.py pipeline \
+uv run modal run workflow.py \
   --epochs 5 \
-  --max_train_samples 16000 \
-  --num_eval_examples 500 \
-  --num_explore_examples 18
+  --max-train-samples 16000 \
+  --num-eval-examples 500 \
+  --num-explore-examples 18
 ```
+
+After the run, the fine-tuned model is written to `outputs/finetuned_model/` and the reports to `outputs/*_report.html`. The model is also persisted to the `bert-emotion-model` Modal volume, which `serve.py` and `app_gradio.py` read from.
 
 ## Parameters
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model_name` | `answerdotai/ModernBERT-base` | HuggingFace encoder model to fine-tune |
+| `--model-name` | `answerdotai/ModernBERT-base` | HuggingFace encoder model to fine-tune |
 | `--epochs` | `3` | Training epochs |
 | `--lr` | `2e-5` | Learning rate |
-| `--batch_size` | `16` | Batch size for training |
-| `--warmup_steps` | `100` | Warmup steps for the scheduler |
-| `--max_train_samples` | `10000` | Number of training examples |
-| `--max_eval_samples` | `2000` | Number of held-out eval examples |
-| `--num_eval_examples` | `200` | Examples used in the base vs fine-tuned comparison |
-| `--num_explore_examples` | `12` | Examples for attention/attribution deep-dive |
+| `--batch-size` | `16` | Batch size for training |
+| `--warmup-steps` | `100` | Warmup steps for the scheduler |
+| `--max-train-samples` | `10000` | Number of training examples |
+| `--max-eval-samples` | `2000` | Number of held-out eval examples |
+| `--num-eval-examples` | `200` | Examples used in the base vs fine-tuned comparison |
+| `--num-explore-examples` | `12` | Examples for attention/attribution deep-dive |
+
+## Inspect runs in the dashboard
+
+Every `modal run` streams logs to your terminal and records the run in the [Modal dashboard](https://modal.com/apps), where you can browse past executions, logs, and per-function container metrics. List your apps with:
+
+```bash
+modal app list
+```
+
+or visit [modal.com/apps](https://modal.com/apps) directly.
 
 ## Model Serving
 
-After training, you can deploy the model as a live API with a Gradio frontend.
+After training, deploy the model as a live API and a Gradio frontend. Both read the fine-tuned model from the `bert-emotion-model` volume, so run the pipeline first.
 
-### Step 1: Deploy the FastAPI server
+### The FastAPI server
 
 ```bash
-python serve.py
+# Dev server with hot-reload (ephemeral URL, tails logs)
+uv run modal serve serve.py
+
+# Persistent deployment (stable URL)
+uv run modal deploy serve.py
 ```
 
-This deploys the fine-tuned model as a `/predict` endpoint that returns:
+This serves the fine-tuned model at a `/predict` endpoint that returns:
 - Predicted emotion and confidence
 - Full probability distribution across all 6 emotions
 - Attention weights per token (for heatmap visualization)
 
-To deploy from a specific training run:
+The model loads once per container via `@modal.enter()` on an `@app.cls`, and the FastAPI app is exposed with `@modal.asgi_app()`.
+
+Test the endpoint (use the URL printed by serve/deploy):
 
 ```bash
-python serve.py --run-name <run-name-from-flyte-ui>
-```
-
-Test the endpoint:
-
-```bash
-curl -X POST https://your-app-url/predict \
+curl -X POST https://<your-app-url>/predict \
   -H "Content-Type: application/json" \
   -d '{"text": "I am so happy today!"}'
 ```
 
-
-
-```bash
-curl -X POST https://empty-snowflake-f34fa.apps.demo.hosted.unionai.cloud/predict  \
-  -H "Content-Type: application/json" \
-  -d '{"text": "I am so happy today!"}'
-```
-
-### Step 2: Deploy the Gradio frontend
+### The Gradio frontend
 
 ```bash
-python app_gradio.py
+# Dev server with hot-reload
+uv run modal serve app_gradio.py
+
+# Persistent deployment
+uv run modal deploy app_gradio.py
 ```
 
-This auto-discovers the FastAPI server and deploys a Gradio UI where users can:
+`modal serve` prints a URL you can open in the browser. The UI lets users:
 - Type text and see emotion predictions with confidence bars
 - View an attention heatmap showing which words the model focuses on
 - Try pre-loaded example texts
 
-For local development (server already running):
-
-```bash
-SERVER_URL=https://your-app-url python app_gradio.py
-```
+The Gradio app loads the fine-tuned model directly from the shared volume and runs inference in-process, so it works on its own once training has produced a model. (`serve.py` is the standalone REST API if you'd rather split the UI from inference.)
 
 ## Why ModernBERT?
 
