@@ -1,4 +1,4 @@
-"""Gemma 4 vision app, served as a Flyte 2 app.
+"""Gemma 4 vision app, served on Modal.
 
 Upload an image; two tabs:
 - **Ask**: free-form Q&A streaming, with optional thinking panel and budget cap
@@ -6,66 +6,36 @@ Upload an image; two tabs:
   them on the image (emergent VLM capability, not a trained detector head)
 
 Same vLLM backend (`gemma4-26b-a4b-it-vllm`) as `chat_app.py` and
-`live_camera_app.py`. `GRADIO_SHARE=1` exposes a public HTTPS tunnel — needed
-for image uploads from a remote browser since `getUserMedia`-style secure-
-context rules apply to anything-but-localhost.
+`live_camera_app.py`. Modal serves the UI over HTTPS, so image uploads from a
+remote browser work with no extra tunnel.
 
-Deploy:
-    GRADIO_SHARE=1 python vision_app.py
+Dev (hot-reload, ephemeral URL):
+    modal serve vision_app.py
+
+Deploy (persistent URL — run after vllm_server.py is deployed):
+    modal deploy vision_app.py
 """
 
 from __future__ import annotations
 
-import os
-
-import flyte
-import flyte.app
-
-from config import MODEL
+import modal
 
 
 VISION_APP_NAME = "gemma4-vision"
 
 vision_image = (
-    flyte.Image.from_debian_base(
-        name="gemma4-vision-image",
-        registry="localhost:30000",
-        platform=("linux/arm64",),
-    )
-    .with_pip_packages(
+    modal.Image.debian_slim(python_version="3.11")
+    # fonts-dejavu-core supplies DejaVuSans-Bold.ttf for the box labels.
+    .apt_install("fonts-dejavu-core")
+    .pip_install(
         "gradio==5.42.0",
         "openai>=1.50.0",
         "pillow>=10.0.0",
+        "fastapi[standard]",
     )
 )
 
-# Pull GRADIO_SHARE etc. from the deploy shell into the pod env.
-_propagated_envs = {
-    k: os.environ[k]
-    for k in ("GRADIO_SHARE",)
-    if k in os.environ
-}
-
-env = flyte.app.AppEnvironment(
-    name=VISION_APP_NAME,
-    image=vision_image,
-    resources=flyte.Resources(cpu="1", memory="2Gi"),
-    port=7861,
-    requires_auth=False,
-    env_vars=_propagated_envs,
-    parameters=[
-        flyte.app.Parameter(
-            name="vllm_url",
-            value=f"http://{MODEL.app_name}-flytesnacks-development.flyte.svc.cluster.local",
-            env_var="VLLM_URL",
-        ),
-        flyte.app.Parameter(name="model_id", value=MODEL.model_id),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=900,   # 15 min — same as live-camera
-    ),
-)
+app = modal.App(VISION_APP_NAME, image=vision_image)
 
 
 # Same parser as chat_app.py — Gemma 4 IT wraps the thought channel in
@@ -90,43 +60,28 @@ def _split_thinking(text: str) -> tuple[str, str]:
     return thinking.strip(), answer.strip()
 
 
-@env.server
-def vision_server(vllm_url: str, model_id: str):
-    """Run the Gradio vision UI. Blocking."""
+@app.function(cpu=1, memory=2048, scaledown_window=900)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    """Build and serve the Gradio vision UI."""
     import base64
     import io
     import json
     import re
-    import threading
-    import time
-    import urllib.request
 
     import gradio as gr
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
     from openai import OpenAI
     from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-    base_url = vllm_url.rstrip("/") + "/v1"
+    from config import MODEL, resolve_vllm_url
+
+    model_id = MODEL.model_id
+    base_url = resolve_vllm_url() + "/v1"
     print(f"[vision] gradio={gr.__version__}  vllm={base_url}  model={model_id}", flush=True)
     client = OpenAI(base_url=base_url, api_key="not-used")
-
-    # --- Knative keep-alive while there's real activity (same trick as -------
-    #     live_camera_app.py — gradio.live tunnel bypasses queue-proxy).
-    last_activity_ts = [0.0]
-    KEEPALIVE_PERIOD_S = 60
-    ACTIVITY_WINDOW_S = 300
-
-    def _keepalive_loop():
-        while True:
-            time.sleep(KEEPALIVE_PERIOD_S)
-            if time.time() - last_activity_ts[0] > ACTIVITY_WINDOW_S:
-                continue
-            try:
-                urllib.request.urlopen("http://localhost:8012/", timeout=3)
-            except Exception:
-                pass
-
-    threading.Thread(target=_keepalive_loop, daemon=True).start()
-    # ------------------------------------------------------------------------
 
     CHARS_PER_TOKEN = 3.5
 
@@ -166,7 +121,6 @@ def vision_server(vllm_url: str, model_id: str):
         if not question or not question.strip():
             yield "", "Ask a question about the image."
             return
-        last_activity_ts[0] = time.time()
 
         img = _load_and_orient(image_path)
         data_url = _encode_to_data_url(img)
@@ -319,7 +273,6 @@ def vision_server(vllm_url: str, model_id: str):
     def detect(image_path, target, temperature):
         if not image_path:
             return None, "Upload an image first.", ""
-        last_activity_ts[0] = time.time()
         target = (target or "").strip() or "the main objects"
         base = _load_and_orient(image_path)
         data_url = _encode_to_data_url(base)
@@ -416,22 +369,4 @@ def vision_server(vllm_url: str, model_id: str):
                     outputs=[annotated, detections_json, raw_output],
                 )
 
-    share = os.environ.get("GRADIO_SHARE", "0") == "1"
-    _, local_url, share_url = demo.launch(
-        server_name="0.0.0.0", server_port=7861, share=share, prevent_thread_lock=True,
-    )
-    print(f"[vision] local URL: {local_url}", flush=True)
-    if share_url:
-        print(f"[vision] PUBLIC HTTPS URL: {share_url}", flush=True)
-    else:
-        print("[vision] no share URL (set GRADIO_SHARE=1 on deploy)", flush=True)
-    while True:
-        time.sleep(3600)
-
-
-if __name__ == "__main__":
-    import pathlib
-
-    flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-    app = flyte.with_servecontext(interactive_mode=True).serve(env)
-    print(f"Vision app deployed: {app.url}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")

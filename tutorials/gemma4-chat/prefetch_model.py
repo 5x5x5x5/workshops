@@ -1,38 +1,47 @@
-"""Prefetch a Gemma 4 model from Hugging Face into the Flyte object store.
+"""Prefetch a Gemma 4 model from Hugging Face into the Modal `hf-cache` Volume.
 
-Standalone helper — useful when you want to download/cache before deploying,
-or to verify the model + HF_TOKEN secret work. The deploy in `vllm_server.py`
-also calls this same prefetch (it's run-cached, so calling it twice is cheap).
+Standalone helper — useful when you want to download/cache the gated weights
+before deploying, or to verify the model + `huggingface-secret` work. The vLLM
+server also downloads on first cold start (into the same Volume), so running
+this first just moves that one-time download out of the serving path.
 
 Usage:
-    flyte create secret HF_TOKEN  # one-time, paste your HF token
-    python prefetch_model.py      # 26B-A4B by default
-    GEMMA_VARIANT=31b python prefetch_model.py
+    modal secret create huggingface-secret HF_TOKEN=hf_...   # one-time
+    modal run prefetch_model.py            # 26B-A4B by default
+    GEMMA_VARIANT=31b modal run prefetch_model.py
 """
 
 from __future__ import annotations
 
-import flyte
-import flyte.prefetch
-from flyte.remote import Run
+import modal
 
-from config import MODEL
+from config import MODEL, hf_secret, hf_cache, HF_CACHE_PATH
 
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("huggingface_hub[hf_transfer]")
+    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1", "HF_HOME": HF_CACHE_PATH})
+)
 
-def prefetch() -> Run:
-    flyte.init_from_config()
-    print(f"Prefetching {MODEL.hf_repo} → Flyte object store…")
-    run: Run = flyte.prefetch.hf_model(
-        repo=MODEL.hf_repo,
-        # Default `hf_token_key="HF_TOKEN"` — create the secret with
-        #   flyte create secret HF_TOKEN
-        # before running this.
-    )
-    run.wait()
-    print(f"Prefetch run: {run.url}")
-    print(f"Run name (use this in vllm_server.py if deploying separately): {run.name}")
-    return run
+app = modal.App("gemma4-prefetch", image=image)
 
 
-if __name__ == "__main__":
-    prefetch()
+@app.function(
+    secrets=[hf_secret],
+    volumes={HF_CACHE_PATH: hf_cache},
+    timeout=3600,
+)
+def prefetch() -> None:
+    from huggingface_hub import snapshot_download
+
+    print(f"Prefetching {MODEL.hf_repo} → hf-cache Volume…")
+    # HF_TOKEN comes from the huggingface-secret; the account must have accepted
+    # the Gemma license.
+    snapshot_download(MODEL.hf_repo)
+    hf_cache.commit()
+    print(f"Done. {MODEL.hf_repo} is cached and ready for vllm_server.py.")
+
+
+@app.local_entrypoint()
+def main():
+    prefetch.remote()

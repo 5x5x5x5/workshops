@@ -1,31 +1,27 @@
-# DGX Spark setup for the Gemma 4 chat tutorial
+# Setup for the Gemma 4 chat tutorial (Modal)
 
-This is the minimal, ordered checklist to go from a freshly imaged **NVIDIA DGX Spark** (Grace-Blackwell GB10, aarch64, ~119 GiB unified memory) to the two Flyte 2 apps in this directory running and serving chat.
+This is the minimal, ordered checklist to go from nothing to the four apps in
+this directory running on [Modal](https://modal.com) and serving chat.
 
-Read this before `README.md` — `README.md` documents the *what* and the *why-it-broke-and-how-we-fixed-it*. This doc is just *what to actually run*.
+> **What changed from the original:** this tutorial used to target a local
+> **NVIDIA DGX Spark** (Grace-Blackwell GB10, aarch64) running a self-managed
+> GPU cluster. On Modal there's no host to image, no local GPU driver / runtime
+> to install, no cluster to start, and no arch/registry wrangling — Modal
+> provisions the GPUs and runs the containers. So all the host-provisioning,
+> `nvidia-smi`, container-runtime, and cluster-bootstrap steps are gone. What
+> remains is: a Modal account, the HuggingFace secret, an optional prefetch,
+> and deploying the apps.
 
-## 0. Host prerequisites
+## 0. Prerequisites
 
-You need on the Spark host:
+You need locally:
 
 ```bash
-# NVIDIA driver visible
-nvidia-smi -L
-# → GPU 0: NVIDIA GB10 (UUID: ...)
-
-# Docker daemon up, with nvidia-container-toolkit hooks installed
-docker run --rm --gpus all nvcr.io/nvidia/cuda:13.0.0-base-ubuntu22.04 nvidia-smi -L
-
 # uv (https://docs.astral.sh/uv/)
 uv --version
-
-# Architecture sanity check — must be aarch64
-uname -m
 ```
 
-If `docker run --gpus all` fails, install/configure the NVIDIA container runtime first ([docs](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)).
-
-If you'll be SSH'ing/Tailscaling in from elsewhere, install Tailscale on the Spark and bring it up (`tailscale up`) — the devbox UI binds to `0.0.0.0:30080` so reaching it via the Spark's Tailscale IP just works.
+That's it — no Docker, no GPU, no NVIDIA runtime. The GPUs live in Modal's cloud.
 
 ## 1. HuggingFace: token + Gemma 4 license
 
@@ -34,9 +30,9 @@ Gemma 4 weights are gated. On HuggingFace:
 1. Visit `https://huggingface.co/google/gemma-4-26B-A4B-it` and click **Acknowledge license**.
 2. Generate a read-only token at `https://huggingface.co/settings/tokens`.
 
-Keep that token handy — you'll paste it into a Flyte secret in step 5.
+Keep that token handy — you'll put it into a Modal secret in step 4.
 
-## 2. Clone + venv + Flyte CLI
+## 2. Clone + venv + Modal CLI
 
 ```bash
 cd tutorials/gemma4-chat
@@ -45,139 +41,132 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# `flyte` is a console script provided by the `flyte` package
-flyte --version
-# → Flyte SDK version: 2.x.y
+# `modal` is a console script provided by the `modal` package
+modal --version
 ```
 
-## 3. Start the devbox **with `--gpu`**
-
-This is the single most-missed step. Without `--gpu`, the devbox container is started with `runc` (no GPU) and your workload pods schedule but can't actually use the GPU.
+## 3. Authenticate with Modal (one-time)
 
 ```bash
-flyte start devbox --gpu
+uv run modal setup
 ```
 
-Verify the GPU is visible from inside the devbox container:
+This opens a browser to log in / sign up. No account? Create one at
+[modal.com](https://modal.com).
+
+## 4. Create the HF token secret
 
 ```bash
-docker exec flyte-devbox nvidia-smi -L
-# → GPU 0: NVIDIA GB10 (UUID: ...)
+modal secret create huggingface-secret HF_TOKEN=hf_xxx
 ```
 
-Also confirm k3s has the device plugin and the node has `nvidia.com/gpu: 1`:
+(The token from step 1. You can also create it in the Modal dashboard under
+**Secrets**.) The vLLM server and the prefetch job read `HF_TOKEN` from this
+secret.
+
+## 5. Prefetch the model (recommended)
+
+Download the gated weights into the `hf-cache` Modal Volume once, so the vLLM
+server doesn't pay the download on its first cold start (~52 GB for the default
+26B-A4B model):
 
 ```bash
-docker exec flyte-devbox kubectl get node -o jsonpath='{.items[0].status.capacity.nvidia\.com/gpu}'
-# → 1
+modal run prefetch_model.py
+# 31B variant:
+GEMMA_VARIANT=31b modal run prefetch_model.py
 ```
 
-## 4. Configure the Flyte CLI to point at the devbox
+You can skip this — the vLLM server will download into the same Volume on its
+first startup — but prefetching keeps that one-time cost out of the serving
+path.
+
+## 6. Deploy the vLLM model server
 
 ```bash
-flyte create config \
-    --endpoint localhost:30080 \
-    --project flytesnacks \
-    --domain development \
-    --builder local \
-    --insecure
-```
-
-This writes `.flyte/config.yaml` in the current directory.
-
-## 5. Create the HF_TOKEN secret
-
-```bash
-flyte create secret HF_TOKEN
-# paste the hf_xxx token from step 1 (input is hidden)
-```
-
-Verify:
-
-```bash
-flyte get secret | grep HF_TOKEN
-# → HF_TOKEN regular ... FULLY_PRESENT
-```
-
-## 6. Open the Flyte UI
-
-- Locally on the Spark: <http://localhost:30080/v2>
-- From a Tailscale-connected machine: `http://<spark-tailscale-ip>:30080/v2`
-  (find the IP with `tailscale ip` on the Spark)
-
-You'll watch the deploys land here in steps 7–8.
-
-## 7. Deploy the vLLM model server
-
-This single command does everything: prefetches the model from HF into Flyte's object store (one-shot, ~15-20 min the first time), builds the vLLM image, pushes it to the devbox-local registry, and registers the app with Knative.
-
-```bash
-python vllm_server.py
+modal deploy vllm_server.py
 ```
 
 Things to know:
 
-- **Model**: `google/gemma-4-26B-A4B-it`. ~52 GB safetensors. The IT (instruction-tuned) variant — needed for chat format and thinking-mode support.
-- **Image**: `vllm/vllm-openai:gemma4-cu130` as the base, layered with `flyteplugins-vllm` (provides `vllm-fserve` for streaming weights from object store to GPU). NVIDIA's gemma4 fork — vanilla vLLM doesn't recognize Gemma 4's architecture.
-- **GPU**: `gpu=1` (any GPU, not typed). The local devbox node is labeled GB10 and a typed `"H100:1"` request would silently match nothing.
-- **Memory**: `--gpu-memory-utilization 0.85`. GB10's 119.7 GiB unified memory has ~106 GiB free at startup; the default 0.9 ratio overshoots by ~1 GiB and crashes with `ValueError: Free memory < desired`.
-- **Cold start**: ~6 min — image pull (cached after first), safetensors stream from object store, Inductor compile, CUDA-graph capture across 50+ batch sizes.
-- **Autoscale**: scales to 0 after 30 min idle. First message after that pays the full cold start.
+- **Model**: `google/gemma-4-26B-A4B-it`. ~52 GB safetensors. The IT
+  (instruction-tuned) variant — needed for chat format and thinking-mode
+  support.
+- **Image**: `vllm/vllm-openai:gemma4-cu130` (via `modal.Image.from_registry`).
+  NVIDIA's Gemma 4 fork — vanilla vLLM doesn't recognize Gemma 4's architecture.
+- **GPU**: `A100` for the default MoE model. The dense `31b` variant uses
+  `A100:2` (tensor-parallel across 2 GPUs).
+- **Cold start**: a few minutes on first load — image pull (cached after first),
+  weight load, kernel compile, CUDA-graph capture.
+- **Autoscale**: scales to 0 after 30 min idle (`scaledown_window=1800`). First
+  request after that pays the full cold start.
 
-If the prefetch step hangs on HuggingFace timeouts (it sometimes does), let it retry — it's run-cached so re-running is cheap. If you have a known-good prefetch run name, skip the re-prefetch:
+The command prints the server's public URL, e.g.
+`https://<workspace>--gemma4-26b-a4b-it-vllm-serve.modal.run`. Its OpenAI base
+URL is that `+ /v1`, and OpenAPI docs are at `+ /docs`.
+
+## 7. Deploy the Gradio front-ends
 
 ```bash
-GEMMA_PREFETCH_RUN=<run-name-from-flyte-ui> python vllm_server.py
+modal deploy chat_app.py
+modal deploy vision_app.py
+modal deploy live_camera_app.py
 ```
 
-## 8. Deploy the Gradio chat UI
+These are small CPU-only images (Gradio + the OpenAI client). Each resolves the
+deployed vLLM app's URL **by name** at startup (via
+`modal.Function.from_name(...).get_web_url()`), so no wiring is needed as long
+as the vLLM app is deployed first.
+
+Each command prints the app's public HTTPS URL. Open it in a browser.
+
+## 8. Open the chat
+
+Paste the printed chat URL into a browser and type a message. The 🧠 Thinking
+panel fills with the model's reasoning, then the answer appears below it.
+
+For the live-camera app, the webcam works directly — Modal serves over HTTPS, so
+`getUserMedia`'s secure-context requirement is satisfied with no extra tunnel.
+
+## Iterating with `modal serve`
+
+For a hot-reloading dev URL that tears down on Ctrl-C, use `modal serve` instead
+of `modal deploy`:
 
 ```bash
-python chat_app.py
+modal serve vllm_server.py    # ephemeral vLLM URL
+modal serve chat_app.py       # hot-reloads on save
 ```
 
-This is a much smaller image (just `gradio` + `openai`); build is fast. The chat app talks to the vLLM app over the **cluster-internal Knative DNS** (`http://<app>.flyte.svc.cluster.local`), not the public `.localhost` URL — that one only resolves on the host.
+To point a `modal serve` front-end at an ad-hoc `modal serve` vLLM URL, set
+`VLLM_URL`:
 
-The chat URL is logged at the end:
-
-```
-Chat UI deployed: http://gemma4-chat-ui-flytesnacks-development.localhost:30081/
-```
-
-## 9. Open the chat
-
-From the Spark itself: paste the URL above into a browser.
-
-From a remote/Tailscaled machine: Knative routes by `Host` header, so add this to **your local** `/etc/hosts` (the machine you're browsing from):
-
-```
-<spark-tailscale-ip>  gemma4-chat-ui-flytesnacks-development.localhost gemma4-26b-a4b-it-vllm-flytesnacks-development.localhost
+```bash
+VLLM_URL=https://<workspace>--gemma4-26b-a4b-it-vllm-serve.modal.run modal serve chat_app.py
 ```
 
-Then `http://gemma4-chat-ui-flytesnacks-development.localhost:30081/` works.
-
-Type a message. The 🧠 Thinking panel fills with the model's reasoning, then the answer appears below it.
-
-## DGX-Spark-specific values cheat sheet
+## Values cheat sheet
 
 | Setting | Value | Why |
 |---|---|---|
-| `flyte start devbox` | `--gpu` | adds `--gpus all` + uses `flyte-devbox:gpu-latest` |
-| `gpu` in `flyte.Resources` | `1` | typed labels (`H100`, `L40s`) don't match the GB10 node |
-| `--gpu-memory-utilization` | `0.85` | only ~106 GiB free of 119.7 GiB unified memory |
-| `Image.from_*(registry=...)` | `"localhost:30000"` | otherwise SDK pushes to `ghcr.io/flyteorg` and 403s |
-| `Image.platform` | `("linux/arm64",)` | host is aarch64; QEMU-emulated amd64 segfaults on `uv venv` |
-| vLLM base image | `vllm/vllm-openai:gemma4-cu130` | Gemma 4 architecture support + Blackwell sm_120 kernels |
-| `flyteplugins-vllm` install | via `with_commands(["/usr/bin/python3 -m pip install --pre flyteplugins-vllm"])` | base image's torch/vllm live in system Python, not Flyte's `/opt/venv` |
-| HF model | `google/gemma-4-26B-A4B-it` (IT variant) | base model has no chat template; IT ships `chat_template.jinja` |
-| inter-app URL | `http://<app>-flytesnacks-development.flyte.svc.cluster.local` | Knative `.localhost` only resolves on the host, not from sibling pods |
+| `gpu` in `config.py` | `A100` (MoE) / `A100:2` (dense 31B) | 52 GB / 62 GB of weights + KV cache |
+| `--gpu-memory-utilization` | `0.90` | vLLM default; dedicated A100 has the headroom |
+| vLLM base image | `vllm/vllm-openai:gemma4-cu130` | Gemma 4 architecture support |
+| HF model | `google/gemma-4-26B-A4B-it` (IT variant) | IT ships `chat_template.jinja` for `/v1/chat/completions` |
+| weight cache | `hf-cache` Modal Volume at `/root/.cache/huggingface` | download the gated weights once |
+| inter-app URL | `Function.from_name(app, "serve").get_web_url()` | front-ends resolve the vLLM URL by name |
 
 ## Tear down
 
-```bash
-# stop the devbox (preserves data volume — apps and prefetched models survive a restart)
-flyte stop devbox
+Modal apps scale to zero when idle, so an idle deploy costs nothing. To remove a
+deployed app entirely:
 
-# fully delete the devbox cluster + its volume
-flyte delete devbox --volume
+```bash
+modal app stop gemma4-26b-a4b-it-vllm
+modal app stop gemma4-chat-ui
+modal app stop gemma4-vision
+modal app stop gemma4-live-camera
 ```
+
+(Use `modal app list` to see running apps.) The `hf-cache` Volume persists across
+deploys; delete it with `modal volume delete hf-cache` if you want to reclaim the
+weight storage.

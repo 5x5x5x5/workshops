@@ -1,73 +1,33 @@
-"""Gradio chat UI for Gemma 4, fronting the vLLM server.
+"""Gradio chat UI for Gemma 4, fronting the vLLM server, served on Modal.
 
-This is a Flyte 2 pickled-mode app: `@env.server` is shipped to the Flyte
-container along with the Gradio UI definition. The vLLM server's URL is
-injected at runtime via the `vllm_url` parameter (resolved via AppEndpoint
-+ depends_on).
+The UI is a Gradio app mounted on FastAPI and served as a Modal ASGI app. The
+vLLM server's URL is resolved at container startup via `resolve_vllm_url()`
+(looks up the deployed vLLM web endpoint by name, or honors `VLLM_URL`).
 
-Deploy (after `python vllm_server.py` has finished):
-    python chat_app.py
+Dev (hot-reload, ephemeral URL):
+    modal serve chat_app.py
+
+Deploy (persistent URL — run after vllm_server.py is deployed):
+    modal deploy chat_app.py
 """
 
 from __future__ import annotations
 
-import flyte
-import flyte.app
+import modal
 
 from config import CHAT_APP_NAME, MODEL
 
 
 # Frontend image. We don't need vllm here — just an OpenAI client + Gradio.
+# Gradio 5.x is required for `gr.Chatbot(type="messages")` (the metadata-titled
+# 🧠 Thinking panel relies on the messages format). Gradio 6.x dropped that
+# kwarg and 4.x doesn't have messages format at all.
 chat_image = (
-    flyte.Image.from_debian_base(
-        name="gemma4-chat-image",
-        # Same as vllm_server.py — push to devbox-local registry and build only
-        # for the host architecture (aarch64) so QEMU-emulated amd64 doesn't
-        # segfault during `uv venv`.
-        registry="localhost:30000",
-        platform=("linux/arm64",),
-    )
-    # Gradio 5.x: needed for `gr.Chatbot(type="messages")` (the metadata-titled
-    # 🧠 Thinking panel relies on the messages format). Gradio 6.x dropped that
-    # kwarg and 4.x doesn't have messages format at all. Pinning to a known-
-    # good 5.x release; the explicit `while True: sleep` fallback in
-    # `_run` keeps the pod alive even if launch()'s blocking behavior changes.
-    .with_pip_packages("gradio==5.42.0", "openai>=1.50.0")
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("gradio==5.42.0", "openai>=1.50.0", "fastapi[standard]")
 )
 
-env = flyte.app.AppEnvironment(
-    name=CHAT_APP_NAME,
-    image=chat_image,
-    resources=flyte.Resources(cpu="1", memory="2Gi"),
-    port=7860,
-    requires_auth=False,
-    parameters=[
-        # Pass the vLLM URL directly as a string — bypass `AppEndpoint`.
-        #
-        # Background: `AppEndpoint(app_name=...)` has two modes:
-        #   - public=False: needs INTERNAL_APP_ENDPOINT_PATTERN env var, set
-        #     by `depends_on` deploy-time wiring. But depends_on conflicts
-        #     with pkl-bundle interactive deploy because VLLMAppEnvironment
-        #     has no @server function.
-        #   - public=True: resolves the URL via Flyte's App API, but it
-        #     returns the *external* `<svc>.localhost` URL which only
-        #     resolves on the host — not from inside cluster pods.
-        #
-        # The cluster-internal Knative DNS form is reliable from a sibling
-        # pod and matches Knative's `address.url` for the service. Hardcoding
-        # the project/domain is acceptable for this tutorial.
-        flyte.app.Parameter(
-            name="vllm_url",
-            value=f"http://{MODEL.app_name}-flytesnacks-development.flyte.svc.cluster.local",
-            env_var="VLLM_URL",
-        ),
-        flyte.app.Parameter(name="model_id", value=MODEL.model_id),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=1800,   # 30 min — match vLLM so the UI doesn't disappear before the model
-    ),
-)
+app = modal.App(CHAT_APP_NAME, image=chat_image)
 
 
 def _split_thinking(text: str) -> tuple[str, str]:
@@ -106,27 +66,21 @@ def _split_thinking(text: str) -> tuple[str, str]:
     return thinking.strip(), answer.strip()
 
 
-@env.server
-def chat_server(vllm_url: str, model_id: str):
-    """Run the Gradio chat UI. Blocking."""
-    import sys
-    import traceback
-    try:
-        _run(vllm_url, model_id)
-    except BaseException as e:
-        print(f"!!! chat_server crashed: {type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        sys.stdout.flush()
-        raise
-
-
-def _run(vllm_url: str, model_id: str):
+@app.function(cpu=1, memory=2048, scaledown_window=1800)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    """Build and serve the Gradio chat UI."""
     import gradio as gr
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
     from openai import OpenAI
 
-    print("[chat_server] gradio version:", gr.__version__, flush=True)
-    base_url = vllm_url.rstrip("/") + "/v1"
-    print(f"[chat_server] Connecting to vLLM at {base_url} (model={model_id})", flush=True)
+    from config import MODEL, resolve_vllm_url
+
+    model_id = MODEL.model_id
+    base_url = resolve_vllm_url() + "/v1"
+    print(f"[chat] gradio={gr.__version__}  vllm={base_url}  model={model_id}", flush=True)
     client = OpenAI(base_url=base_url, api_key="not-used")
 
     DEFAULT_SYSTEM = "You are a helpful assistant."
@@ -254,7 +208,7 @@ def _run(vllm_url: str, model_id: str):
     with gr.Blocks(title=f"Gemma 4 Chat ({model_id})") as demo:
         gr.Markdown(
             f"# Gemma 4 Chat\n"
-            f"Served by vLLM on Flyte. Model: `{model_id}` · Endpoint: `{base_url}`"
+            f"Served by vLLM on Modal. Model: `{model_id}` · Endpoint: `{base_url}`"
         )
         with gr.Row():
             temperature = gr.Slider(0.0, 1.5, value=1.0, step=0.05, label="Temperature")
@@ -285,17 +239,4 @@ def _run(vllm_url: str, model_id: str):
         send.click(chat, inputs=inputs, outputs=outputs)
         clear.click(lambda: [], outputs=chatbot)
 
-    print("[chat_server] About to demo.launch()", flush=True)
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
-    print("[chat_server] demo.launch() returned — sleeping forever to keep pod alive", flush=True)
-    import time
-    while True:
-        time.sleep(3600)
-
-
-if __name__ == "__main__":
-    import pathlib
-
-    flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-    app = flyte.with_servecontext(interactive_mode=True).serve(env)
-    print(f"Chat UI deployed: {app.url}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")

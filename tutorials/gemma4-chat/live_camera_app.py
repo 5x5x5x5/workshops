@@ -1,121 +1,81 @@
-"""Gemma 4 live-camera describer, served as a Flyte 2 app.
+"""Gemma 4 live-camera describer, served on Modal.
 
 Webcam → Gemma 4 IT vision → streaming caption every few seconds. Reuses the
 same `gemma4-26b-a4b-it-vllm` server as `chat_app.py`; this is a separate
-Gradio frontend app pointed at the same OpenAI-compatible endpoint.
+Gradio frontend pointed at the same OpenAI-compatible endpoint.
 
 Two modes:
 - independent: each caption is a fresh description of the current frame
 - narrative:   the prompt includes recent captions so the model focuses on
                what changed — feels like live commentary
 
-Webcam access (`getUserMedia`) requires a secure context — works on
-`http://localhost:30081/...` directly on the Spark, but **not** from a
-Tailscaled remote browser. Set `GRADIO_SHARE=1` to launch a public HTTPS
-tunnel via Gradio servers in that case.
+Webcam access (`getUserMedia`) requires a secure context. Modal serves this UI
+over HTTPS, so the webcam works from any browser with no extra tunnel.
 
-Deploy:
-    python live_camera_app.py
+Dev (hot-reload, ephemeral URL):
+    modal serve live_camera_app.py
+
+Deploy (persistent URL — run after vllm_server.py is deployed):
+    modal deploy live_camera_app.py
+
+Tunables (set as env vars before `modal serve`/`modal deploy`):
+    CAMERA_CADENCE  seconds between captions (default 3)
+    MAX_SIDE        downsample long side in px (default 384)
+    MAX_OUT_TOKENS  cap reply length (default 60)
 """
 
 from __future__ import annotations
 
 import os
 
-import flyte
-import flyte.app
-
-from config import MODEL  # MODEL.app_name, MODEL.model_id
+import modal
 
 
 LIVE_CAM_APP_NAME = "gemma4-live-camera"
 
-# Pull GRADIO_SHARE / CAMERA_CADENCE etc. from THIS shell's env at deploy time
-# and propagate them into the pod via env_vars. Without this the @env.server
-# function would only see the pod's environment (set by Knative), not yours.
+# Propagate the caption tunables from the deploy shell into the container.
 _propagated_envs = {
     k: os.environ[k]
-    for k in ("GRADIO_SHARE", "CAMERA_CADENCE", "MAX_SIDE", "MAX_OUT_TOKENS")
+    for k in ("CAMERA_CADENCE", "MAX_SIDE", "MAX_OUT_TOKENS")
     if k in os.environ
 }
 
-chat_image = (
-    flyte.Image.from_debian_base(
-        name="gemma4-live-camera-image",
-        registry="localhost:30000",
-        platform=("linux/arm64",),
+cam_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install(
+        "gradio==5.42.0",
+        "openai>=1.50.0",
+        "pillow>=10.0.0",
+        "fastapi[standard]",
     )
-    .with_pip_packages("gradio==5.42.0", "openai>=1.50.0", "pillow>=10.0.0")
+    .env(_propagated_envs)
 )
 
-env = flyte.app.AppEnvironment(
-    name=LIVE_CAM_APP_NAME,
-    image=chat_image,
-    resources=flyte.Resources(cpu="1", memory="2Gi"),
-    port=7867,
-    requires_auth=False,
-    env_vars=_propagated_envs,
-    parameters=[
-        # Same internal-URL trick as `chat_app.py`. Avoids depends_on +
-        # AppEndpoint complexity for a tutorial deploy on the local devbox.
-        flyte.app.Parameter(
-            name="vllm_url",
-            value=f"http://{MODEL.app_name}-flytesnacks-development.flyte.svc.cluster.local",
-            env_var="VLLM_URL",
-        ),
-        flyte.app.Parameter(name="model_id", value=MODEL.model_id),
-    ],
-    scaling=flyte.app.Scaling(
-        replicas=(0, 1),
-        scaledown_after=900,   # 15 min idle → kill pod (and its gradio.live tunnel)
-    ),
-)
+app = modal.App(LIVE_CAM_APP_NAME, image=cam_image)
 
 
-@env.server
-def live_camera_server(vllm_url: str, model_id: str):
-    """Run the Gradio live-camera UI. Blocking."""
+@app.function(cpu=1, memory=2048, scaledown_window=900)
+@modal.concurrent(max_inputs=100)
+@modal.asgi_app()
+def ui():
+    """Build and serve the Gradio live-camera UI."""
     import base64
     import io
     import os
     import threading
-    import time
 
     import gradio as gr
+    from fastapi import FastAPI
+    from gradio.routes import mount_gradio_app
     from openai import OpenAI
     from PIL import Image
 
-    base_url = vllm_url.rstrip("/") + "/v1"
+    from config import MODEL, resolve_vllm_url
+
+    model_id = MODEL.model_id
+    base_url = resolve_vllm_url() + "/v1"
     print(f"[live_camera] gradio={gr.__version__}  vllm={base_url}  model={model_id}", flush=True)
     client = OpenAI(base_url=base_url, api_key="not-used")
-
-    # ---------------- Knative idle-timer keep-alive ---------------------------
-    # When users access this app via the gradio.live HTTPS tunnel, the request
-    # path is:
-    #   browser → gradio.live → frpc inside pod → gradio on :7867
-    # That bypasses Knative's queue-proxy sidecar (which listens on :8012),
-    # so Knative sees zero ingress activity and scales the pod (and the
-    # tunnel) down at `scaledown_after`. Workaround: while there's *real*
-    # caption activity, periodically poke our own queue-proxy from inside
-    # the pod. That registers as legitimate traffic and resets the idle
-    # timer. Stops pinging when the user stops captioning.
-    import urllib.request
-
-    last_activity_ts = [0.0]   # mutable container so closure can mutate
-    KEEPALIVE_PERIOD_S = 60
-    ACTIVITY_WINDOW_S = 300
-
-    def _keepalive_loop():
-        while True:
-            time.sleep(KEEPALIVE_PERIOD_S)
-            if time.time() - last_activity_ts[0] > ACTIVITY_WINDOW_S:
-                continue   # no recent activity → let Knative scale down
-            try:
-                urllib.request.urlopen("http://localhost:8012/", timeout=3)
-            except Exception:
-                pass   # best-effort — don't crash the server thread
-
-    threading.Thread(target=_keepalive_loop, daemon=True).start()
 
     # --- tunables ---
     CADENCE_S = float(os.environ.get("CAMERA_CADENCE", "3"))
@@ -157,9 +117,6 @@ def live_camera_server(vllm_url: str, model_id: str):
 
         if not inflight.acquire(blocking=False):
             return
-
-        # Mark activity so the keep-alive loop knows to ping Knative.
-        last_activity_ts[0] = time.time()
 
         try:
             img_b64 = encode_frame(frame)
@@ -292,25 +249,4 @@ def live_camera_server(vllm_url: str, model_id: str):
         )
         stop_btn.click(stop, outputs=[caption_timer, running])
 
-    share = os.environ.get("GRADIO_SHARE", "0") == "1"
-    # Capture launch() return value so we can flush the public share URL to
-    # stdout — Gradio prints it itself but Python's stdout buffering inside
-    # the Knative pod swallows it before our infinite-sleep fallback runs.
-    _, local_url, share_url = demo.launch(
-        server_name="0.0.0.0", server_port=7867, share=share, prevent_thread_lock=True,
-    )
-    print(f"[live_camera] local URL: {local_url}", flush=True)
-    if share_url:
-        print(f"[live_camera] PUBLIC HTTPS URL: {share_url}", flush=True)
-    else:
-        print("[live_camera] no share URL (set GRADIO_SHARE=1 on deploy)", flush=True)
-    while True:
-        time.sleep(3600)
-
-
-if __name__ == "__main__":
-    import pathlib
-
-    flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
-    app = flyte.with_servecontext(interactive_mode=True).serve(env)
-    print(f"Live-camera app deployed: {app.url}")
+    return mount_gradio_app(app=FastAPI(), blocks=demo, path="/")
